@@ -1,14 +1,13 @@
-mod api;
-mod document;
-mod sse;
-
-use axum::{routing::get, Router};
+use clap::Parser;
+use commonplace_doc::{cli::Args, create_router_with_store, store::CommitStore};
 use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
+    // Parse CLI arguments
+    let args = Args::parse();
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -18,20 +17,26 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Create commit store if database path is provided
+    let commit_store = args.database.as_ref().map(|path| {
+        tracing::info!("Using database at: {}", path.display());
+        CommitStore::new(path).expect("Failed to create commit store")
+    });
+
+    if commit_store.is_none() {
+        tracing::warn!("No database specified - commit functionality will be disabled");
+        tracing::warn!("Use --database <path> to enable commits");
+    }
+
     // Build our application with routes
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .merge(api::router())
-        .nest("/sse", sse::router())
-        .layer(CorsLayer::permissive());
+    let app = create_router_with_store(commit_store);
 
     // Run the server
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
+        .parse()
+        .expect("Invalid address");
+
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn health_check() -> &'static str {
-    "OK"
 }

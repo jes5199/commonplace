@@ -1,0 +1,19 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-doc")]
+#[clap(about = "A document server with Yjs commit history", long_about = None)]
+pub struct Args {
+    /// Path to the redb database file
+    #[clap(short, long, value_name = "FILE")]
+    pub database: Option<PathBuf>,
+
+    /// Port to listen on
+    #[clap(short, long, default_value = "3000")]
+    pub port: u16,
+
+    /// Host to bind to
+    #[clap(long, default_value = "127.0.0.1")]
+    pub host: String,
+}
