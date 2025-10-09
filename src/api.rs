@@ -1,14 +1,14 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::Json,
-    routing::{delete, get, post, put},
-    Router,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 
-use crate::document::DocumentStore;
+use crate::document::{ContentType, DocumentStore};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -20,64 +20,56 @@ pub fn router() -> Router {
     let state = ApiState { store };
 
     Router::new()
-        .route("/documents", post(create_document))
-        .route("/documents/:id", get(get_document))
-        .route("/documents/:id", put(update_document))
-        .route("/documents/:id", delete(delete_document))
-        .route("/documents", get(list_documents))
+        .route("/docs", post(create_document))
+        .route("/docs/:id", get(get_document))
+        .route("/docs/:id", delete(delete_document))
         .with_state(state)
 }
 
-#[derive(Deserialize)]
-struct CreateDocumentRequest {
-    name: Option<String>,
-}
-
 #[derive(Serialize)]
-struct DocumentResponse {
+struct CreateDocumentResponse {
     id: String,
-    name: String,
 }
 
 async fn create_document(
     State(state): State<ApiState>,
-    Json(payload): Json<CreateDocumentRequest>,
-) -> Result<Json<DocumentResponse>, StatusCode> {
-    let name = payload.name.clone();
-    let id = state.store.create_document(payload.name).await;
-    Ok(Json(DocumentResponse {
-        id: id.clone(),
-        name: name.unwrap_or_else(|| id),
-    }))
+    headers: HeaderMap,
+) -> Result<Json<CreateDocumentResponse>, StatusCode> {
+    // Get Content-Type header
+    let content_type_str = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    // Parse content type
+    let content_type = ContentType::from_mime(content_type_str)
+        .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+
+    // Create document
+    let id = state.store.create_document(content_type).await;
+
+    Ok(Json(CreateDocumentResponse { id }))
 }
 
 async fn get_document(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<u8>>, StatusCode> {
-    state
+) -> Result<Response, StatusCode> {
+    let doc = state
         .store
         .get_document(&id)
         .await
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-#[derive(Deserialize)]
-struct UpdateDocumentRequest {
-    update: Vec<u8>,
-}
-
-async fn update_document(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-    Json(payload): Json<UpdateDocumentRequest>,
-) -> Result<StatusCode, StatusCode> {
-    if state.store.apply_update(&id, payload.update).await {
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
+    // Return content with appropriate Content-Type header
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            doc.content_type.to_mime(),
+        )],
+        doc.content,
+    )
+        .into_response())
 }
 
 async fn delete_document(
@@ -89,14 +81,4 @@ async fn delete_document(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
-}
-
-#[derive(Serialize)]
-struct ListDocumentsResponse {
-    documents: Vec<String>,
-}
-
-async fn list_documents(State(state): State<ApiState>) -> Json<ListDocumentsResponse> {
-    let documents = state.store.list_documents().await;
-    Json(ListDocumentsResponse { documents })
 }

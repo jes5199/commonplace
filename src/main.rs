@@ -21,7 +21,7 @@ async fn main() {
     // Build our application with routes
     let app = Router::new()
         .route("/health", get(health_check))
-        .nest("/api", api::router())
+        .merge(api::router())
         .nest("/sse", sse::router())
         .layer(CorsLayer::permissive());
 

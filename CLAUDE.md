@@ -4,44 +4,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-This is a Rust server for managing Yjs documents. The server exposes a custom API over REST and Server-Sent Events (SSE).
+This is a Rust server for managing documents with support for multiple content types (JSON, XML, text). The server exposes a REST API and has SSE capabilities for real-time updates.
 
 ### Architecture
 
 - **Language**: Rust (edition 2021)
-- **Purpose**: Yjs document management server
+- **Purpose**: Document management server with multi-format support
 - **Web Framework**: Axum 0.7
 - **API Protocols**:
-  - REST API for document operations (CRUD)
-  - SSE (Server-Sent Events) for real-time updates
+  - REST API for document CRUD operations
+  - SSE (Server-Sent Events) for real-time updates (placeholder)
 
 ### Key Dependencies
 
 - `axum` - Web framework
 - `tokio` - Async runtime
-- `yrs` - Yjs CRDT implementation for Rust
 - `tower-http` - Middleware (CORS, tracing)
 - `serde` / `serde_json` - Serialization
 - `uuid` - Document ID generation
+- `async-stream` - SSE stream support
 
 ### Code Structure
 
 - `src/main.rs` - Server initialization and routing
-- `src/api.rs` - REST API endpoints for document management
-- `src/document.rs` - DocumentStore managing Yjs documents in-memory
-- `src/sse.rs` - Server-Sent Events for real-time subscriptions
+- `src/api.rs` - REST API endpoints (/docs)
+- `src/document.rs` - DocumentStore with ContentType enum and in-memory storage
+- `src/sse.rs` - Server-Sent Events endpoints (placeholder implementation)
 
 The server runs on `localhost:3000` by default.
 
+### API Endpoints
+
+#### REST API
+- `POST /docs` - Create a blank document (Content-Type header: application/json, application/xml, or text/plain)
+- `GET /docs/{uuid}` - Retrieve document content
+- `DELETE /docs/{uuid}` - Delete a document
+- `GET /health` - Health check
+
+#### SSE (planned)
+- `GET /sse/documents/:id` - Subscribe to document updates
+
+### Document Storage
+
+Documents are stored in-memory with:
+- UUID identifier
+- Content (String)
+- ContentType enum (Json, Xml, Text)
+
+Default content by type:
+- JSON: `{}`
+- XML: `<?xml version="1.0" encoding="UTF-8"?><root/>`
+- Text: empty string
+
 ## Development Commands
 
-Once the Rust project is initialized, common commands will include:
-
 - `cargo build` - Build the project
-- `cargo test` - Run tests
 - `cargo run` - Run the server locally
+- `cargo test` - Run tests
 - `cargo clippy` - Run linter
 - `cargo fmt` - Format code
+- `RUST_LOG=debug cargo run` - Run with debug logging
 
 ## Git Configuration
 
