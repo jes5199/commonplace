@@ -29,10 +29,7 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             commit_store.clone(),
             commit_broadcaster.clone(),
         ))
-        .nest(
-            "/sse",
-            sse::router(doc_store, commit_store, commit_broadcaster),
-        )
+        .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
 }
 

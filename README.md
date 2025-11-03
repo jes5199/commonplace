@@ -107,10 +107,10 @@ Returns "OK" if the server is running.
 
 ### SSE and Change History APIs
 
-- `GET /sse/documents/:id/changes?since=<timestamp>` - Fetch commit history for a document since an optional UNIX timestamp (milliseconds).
-- `GET /sse/documents/changes?doc_ids=<id1,id2,...>&since=<timestamp>` - Fetch commit history for multiple documents.
-- `GET /sse/documents/:id/stream?since=<timestamp>` - Stream commit history for a document, beginning at `since` and continuing with live updates via SSE.
-- `GET /sse/documents/stream?doc_ids=<id1,id2,...>&since=<timestamp>` - Stream commit history across multiple documents via SSE.
+- `GET /documents/:id/changes?since=<timestamp>` - Fetch commit history for a document since an optional UNIX timestamp (milliseconds).
+- `GET /documents/changes?doc_ids=<id1,id2,...>&since=<timestamp>` - Fetch commit history for multiple documents.
+- `GET /documents/:id/stream?since=<timestamp>` - Stream commit history for a document, beginning at `since` and continuing with live updates via SSE.
+- `GET /documents/stream?doc_ids=<id1,id2,...>&since=<timestamp>` - Stream commit history across multiple documents via SSE.
 
 Commit notifications include canonical URLs of the form `commonplace://document/{doc_id}/commit/{commit_id}` that uniquely identify each commit within a document.
 
