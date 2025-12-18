@@ -9,7 +9,7 @@ A Rust server for managing documents with a small REST API, plus Server-Sent Eve
 - Support for multiple content types: JSON, XML, and plain text
 - **Commit endpoint** (`/docs/:id/commit`) that persists content-addressed commits to a local `redb` database (enabled with `--database`)
 - For `text/plain`, `application/json`, and `application/xml` documents, commits are applied to the in-memory document body (so `GET /docs/:id` reflects committed edits)
-- **SSE** endpoint for subscribing to node updates in real-time
+- **SSE** for real-time node subscriptions and document updates with history replay
 - Built with [Axum](https://github.com/tokio-rs/axum) web framework
 - In-memory document storage (document bodies are not persisted)
 
@@ -199,6 +199,8 @@ Removes the wiring between nodes.
 
 ### SSE
 
+#### Node Subscriptions
+
 Subscribe to real-time updates from a node:
 
 ```bash
@@ -215,6 +217,15 @@ Streams Server-Sent Events:
 ```bash
 curl -N http://localhost:3000/sse/nodes/{id}
 ```
+
+#### Document Change History
+
+- `GET /documents/:id/changes?since=<timestamp>` - Fetch commit history for a document since an optional UNIX timestamp (milliseconds).
+- `GET /documents/changes?doc_ids=<id1,id2,...>&since=<timestamp>` - Fetch commit history for multiple documents.
+- `GET /documents/:id/stream?since=<timestamp>` - Stream commit history for a document, beginning at `since` and continuing with live updates via SSE.
+- `GET /documents/stream?doc_ids=<id1,id2,...>&since=<timestamp>` - Stream commit history across multiple documents via SSE.
+
+Commit notifications include canonical URLs of the form `commonplace://document/{doc_id}/commit/{commit_id}` that uniquely identify each commit within a document.
 
 ## Architecture
 
@@ -235,7 +246,8 @@ The server is organized into a few main modules:
   - `types.rs` - Edit, Event, NodeId, NodeMessage types
   - `subscription.rs` - Subscription handling
 - `commit.rs` / `store.rs` - Commit model and `redb`-backed commit storage (optional)
-- `sse.rs` - Server-Sent Events for real-time node subscriptions
+- `events.rs` - Commit broadcast for SSE change notifications
+- `sse.rs` - Server-Sent Events for node subscriptions and document change streams
 - `main.rs` - Server initialization and routing
 
 Documents are stored in-memory using a `DocumentStore`. Each document has:

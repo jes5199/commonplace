@@ -40,7 +40,8 @@ This is a Rust server for managing documents with support for multiple content t
   - `types.rs` - Edit, Event, NodeId, NodeMessage types
   - `subscription.rs` - Subscription handling
 - `src/commit.rs` / `src/store.rs` - Commit model and redb-backed storage
-- `src/sse.rs` - Server-Sent Events for real-time node subscriptions
+- `src/events.rs` - Commit broadcast for SSE change notifications
+- `src/sse.rs` - Server-Sent Events for node subscriptions and document change streams
 
 The server runs on `localhost:3000` by default.
 
@@ -65,6 +66,8 @@ The server runs on `localhost:3000` by default.
 
 #### SSE
 - `GET /sse/nodes/{id}` - Subscribe to real-time updates from a node
+- `GET /documents/{id}/changes` - Get commit history for a document
+- `GET /documents/{id}/stream` - Stream document changes via SSE
 
 ### Document Storage
 
