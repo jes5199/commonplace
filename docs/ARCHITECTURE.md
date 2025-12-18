@@ -327,6 +327,81 @@ flowchart TD
 
 The SSE router shares the same `NodeRegistry` as the API, so updates made via API endpoints are immediately streamed to SSE subscribers.
 
+## Blue and Red Edges
+
+Nodes communicate through two distinct types of connections, visualized as "blue" and "red" edges:
+
+### Blue Edges (Edits/Updates)
+
+Blue edges carry **persistent document changes**:
+
+- **What they carry**: Yjs CRDT commits (merkle-tree nodes with parent references)
+- **Downstream** (subscribe to blue port): Watch a node to see document changes
+- **Upstream** (push to blue port): Send edits back to modify the document
+- **Constraint**: You must listen before editing - edits require parent context from the commit graph
+- **Storage**: Commits are content-addressed (CID) and optionally persisted to the commit store
+
+```
+   [Client]                    [DocumentNode]
+       |                            |
+       |--- subscribe_blue() ------>|  (downstream: watch changes)
+       |<------- Edit --------------|
+       |                            |
+       |-------- Edit ------------->|  (upstream: push edit, needs parent CID)
+       |                            |
+```
+
+### Red Edges (Events)
+
+Red edges carry **ephemeral messages**:
+
+- **What they carry**: JSON envelopes with arbitrary payloads (cursors, presence, metadata)
+- **Fire**: Any client can POST an event to any node's red port (no subscription required)
+- **Subscribe**: Optionally watch a node's red broadcasts
+- **Independence**: Inbound events (what a node receives) and outbound events (what it broadcasts) are unrelated
+- **No persistence**: Events are fire-and-forget, not stored
+
+```
+   [Any Client]                [Node]                    [Subscriber]
+        |                        |                            |
+        |--- POST event -------->|  (fire at red port)        |
+        |                        |                            |
+        |                        |--- event broadcast ------->|  (red subscription)
+        |                        |                            |
+```
+
+### Node Types
+
+| Type | Lifecycle | Purpose |
+|------|-----------|---------|
+| **Document node** | Persistent | Wraps a Yjs document, applies edits, emits changes |
+| **Connection node** | Transient | Represents an SSE client, cleaned up on disconnect |
+| **Virtual node** | Lazy | Created on-demand when first subscribed to by UUID |
+
+### Fanout Model
+
+The node graph enables fanout subscriptions:
+
+```mermaid
+flowchart LR
+    Doc[DocumentNode<br/>doc-123]
+
+    SSE1[ConnectionNode<br/>conn-a]
+    SSE2[ConnectionNode<br/>conn-b]
+    SSE3[ConnectionNode<br/>conn-c]
+
+    Doc -->|blue| SSE1
+    Doc -->|blue| SSE2
+    Doc -->|blue| SSE3
+
+    SSE1 -.->|red events| Doc
+```
+
+- Multiple SSE clients subscribe to the same document
+- Each gets a transient ConnectionNode with a server-generated UUID
+- Edits flow downstream (blue), events can flow in any direction (red)
+- When TCP connection closes, the ConnectionNode is automatically cleaned up
+
 ## Known Limitations / Intentional Gaps
 
 - Document bodies are in-memory only (not persisted).

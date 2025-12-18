@@ -227,6 +227,24 @@ curl -N http://localhost:3000/sse/nodes/{id}
 
 Commit notifications include canonical URLs of the form `commonplace://document/{doc_id}/commit/{commit_id}` that uniquely identify each commit within a document.
 
+### Blue and Red Edges
+
+Nodes communicate through two distinct types of connections:
+
+**Blue edges (edits)** carry persistent document changes:
+- Yjs CRDT commits backed by merkle-tree storage
+- Subscribe downstream to watch changes
+- Push upstream to edit (requires parent context from listening first)
+
+**Red edges (events)** carry ephemeral messages:
+- JSON envelopes for cursors, presence, metadata
+- Any client can POST to any node's red port (no subscription needed)
+- Optionally subscribe to a node's red broadcasts
+
+When you connect via SSE, the server creates a transient **ConnectionNode** with a server-generated UUID. This node subscribes to the document's blue port and has its own red port for receiving events. The node is automatically cleaned up when the TCP connection closes.
+
+See `docs/ARCHITECTURE.md` for detailed diagrams.
+
 ## Architecture
 
 More detailed documentation:

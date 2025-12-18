@@ -34,11 +34,12 @@ This is a Rust server for managing documents with support for multiple content t
 - `src/api.rs` - REST API endpoints (/docs and /nodes)
 - `src/document.rs` - DocumentStore with ContentType enum and in-memory storage
 - `src/node/` - Node trait abstraction for reactive document processing
-  - `mod.rs` - Node trait definition
-  - `document_node.rs` - DocumentNode implementation
-  - `registry.rs` - NodeRegistry with cycle detection
-  - `types.rs` - Edit, Event, NodeId, NodeMessage types
-  - `subscription.rs` - Subscription handling
+  - `mod.rs` - Node trait definition with blue/red port methods
+  - `document_node.rs` - DocumentNode implementation (persistent)
+  - `connection_node.rs` - ConnectionNode for SSE clients (transient)
+  - `registry.rs` - NodeRegistry with cycle detection and lazy creation
+  - `types.rs` - Edit, Event, NodeId, Port types
+  - `subscription.rs` - BlueSubscription, RedSubscription, Subscription
 - `src/commit.rs` / `src/store.rs` - Commit model and redb-backed storage
 - `src/events.rs` - Commit broadcast for SSE change notifications
 - `src/sse.rs` - Server-Sent Events for node subscriptions and document change streams
@@ -65,9 +66,20 @@ The server runs on `localhost:3000` by default.
 - `DELETE /nodes/{from}/wire/{to}` - Remove wiring between nodes
 
 #### SSE
-- `GET /sse/nodes/{id}` - Subscribe to real-time updates from a node
+- `GET /sse/nodes/{id}` - Subscribe to real-time updates from a node (creates transient ConnectionNode)
 - `GET /documents/{id}/changes` - Get commit history for a document
 - `GET /documents/{id}/stream` - Stream document changes via SSE
+
+### Blue and Red Edges
+
+Nodes communicate via two port types:
+
+- **Blue (edits)**: Persistent Yjs commits. Subscribe to watch changes, push to edit. Must listen before editing (need parent context).
+- **Red (events)**: Ephemeral JSON. Any client can POST to any node's red port. Subscribe to watch broadcasts.
+
+SSE connections are transient nodes with server-generated UUIDs. They subscribe to a document's blue port and have their own red port for receiving events.
+
+See `docs/ARCHITECTURE.md` for detailed diagrams.
 
 ### Document Storage
 

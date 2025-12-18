@@ -2,6 +2,17 @@ use crate::commit::Commit;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Specifies which port(s) to subscribe to or wire
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port {
+    /// Blue port: edits only (persistent Yjs commits)
+    Blue,
+    /// Red port: events only (ephemeral JSON)
+    Red,
+    /// Both ports (legacy behavior)
+    Both,
+}
+
 /// A unique identifier for a node in the graph
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);

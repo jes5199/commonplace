@@ -1,6 +1,7 @@
 use super::subscription::SubscriptionId;
-use super::types::{NodeError, NodeId, NodeMessage};
-use super::Node;
+use super::types::{NodeError, NodeId, NodeMessage, Port};
+use super::{DocumentNode, Node};
+use crate::document::ContentType;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,6 +10,8 @@ use tokio::sync::RwLock;
 struct NodeWiring {
     from: NodeId,
     to: NodeId,
+    /// Which port this wiring is for
+    port: Port,
     /// Handle to the task forwarding messages
     task_handle: tokio::task::JoinHandle<()>,
 }
@@ -82,8 +85,50 @@ impl NodeRegistry {
         nodes.get(id).cloned()
     }
 
-    /// Wire two nodes together: edits/events from `from` will be sent to `to`
+    /// Get or create a document node with the given ID and content type.
+    /// If a node with this ID already exists, returns it (ignoring content_type).
+    /// Otherwise creates a new DocumentNode and registers it.
+    pub async fn get_or_create_document(
+        &self,
+        id: &NodeId,
+        content_type: ContentType,
+    ) -> Result<Arc<dyn Node>, NodeError> {
+        // First try to get existing
+        {
+            let nodes = self.nodes.read().await;
+            if let Some(node) = nodes.get(id) {
+                return Ok(node.clone());
+            }
+        }
+
+        // Create new node
+        let node: Arc<dyn Node> = Arc::new(DocumentNode::new(id.0.clone(), content_type));
+        self.register(node.clone()).await?;
+        Ok(node)
+    }
+
+    /// Wire two nodes together on both ports: edits/events from `from` will be sent to `to`
     pub async fn wire(&self, from: &NodeId, to: &NodeId) -> Result<SubscriptionId, NodeError> {
+        self.wire_port(from, to, Port::Both).await
+    }
+
+    /// Wire only the blue port (edits) from one node to another
+    pub async fn wire_blue(&self, from: &NodeId, to: &NodeId) -> Result<SubscriptionId, NodeError> {
+        self.wire_port(from, to, Port::Blue).await
+    }
+
+    /// Wire only the red port (events) from one node to another
+    pub async fn wire_red(&self, from: &NodeId, to: &NodeId) -> Result<SubscriptionId, NodeError> {
+        self.wire_port(from, to, Port::Red).await
+    }
+
+    /// Wire a specific port from one node to another
+    async fn wire_port(
+        &self,
+        from: &NodeId,
+        to: &NodeId,
+        port: Port,
+    ) -> Result<SubscriptionId, NodeError> {
         // Check for cycles before wiring
         if self.would_create_cycle(from, to).await {
             return Err(NodeError::CycleDetected(vec![from.clone(), to.clone()]));
@@ -102,38 +147,91 @@ impl NodeRegistry {
             (from_node, to_node)
         };
 
-        let mut subscription = from_node.subscribe();
         let subscription_id = SubscriptionId::new();
 
-        // Spawn task to forward messages
-        let to_node_clone = to_node.clone();
-        let task_handle = tokio::spawn(async move {
-            loop {
-                match subscription.recv().await {
-                    Ok(msg) => {
-                        let result = match msg {
-                            NodeMessage::Edit(edit) => to_node_clone.receive_edit(edit).await,
-                            NodeMessage::Event(event) => to_node_clone.receive_event(event).await,
-                        };
-                        if let Err(e) = result {
-                            tracing::warn!("Error forwarding message: {}", e);
+        // Spawn appropriate forwarding task based on port
+        let task_handle = match port {
+            Port::Blue => {
+                let mut subscription = from_node.subscribe_blue();
+                let to_node_clone = to_node.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match subscription.recv().await {
+                            Ok(edit) => {
+                                if let Err(e) = to_node_clone.receive_edit(edit).await {
+                                    tracing::warn!("Error forwarding edit: {}", e);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Blue subscription lagged by {} messages", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Source node closed, stopping blue wiring");
+                                break;
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Subscription lagged by {} messages", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("Source node closed, stopping wiring");
-                        break;
-                    }
-                }
+                })
             }
-        });
+            Port::Red => {
+                let mut subscription = from_node.subscribe_red();
+                let to_node_clone = to_node.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match subscription.recv().await {
+                            Ok(event) => {
+                                if let Err(e) = to_node_clone.receive_event(event).await {
+                                    tracing::warn!("Error forwarding event: {}", e);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Red subscription lagged by {} messages", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Source node closed, stopping red wiring");
+                                break;
+                            }
+                        }
+                    }
+                })
+            }
+            Port::Both => {
+                let mut subscription = from_node.subscribe();
+                let to_node_clone = to_node.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match subscription.recv().await {
+                            Ok(msg) => {
+                                let result = match msg {
+                                    NodeMessage::Edit(edit) => {
+                                        to_node_clone.receive_edit(edit).await
+                                    }
+                                    NodeMessage::Event(event) => {
+                                        to_node_clone.receive_event(event).await
+                                    }
+                                };
+                                if let Err(e) = result {
+                                    tracing::warn!("Error forwarding message: {}", e);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Subscription lagged by {} messages", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Source node closed, stopping wiring");
+                                break;
+                            }
+                        }
+                    }
+                })
+            }
+        };
 
         // Record the wiring
         let wiring = NodeWiring {
             from: from.clone(),
             to: to.clone(),
+            port,
             task_handle,
         };
 
@@ -218,8 +316,6 @@ impl NodeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::ContentType;
-    use crate::node::DocumentNode;
 
     #[tokio::test]
     async fn test_registry_register_and_get() {
@@ -324,5 +420,26 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_registry_get_or_create_document() {
+        let registry = NodeRegistry::new();
+
+        // First call should create
+        let node1 = registry
+            .get_or_create_document(&NodeId::new("lazy-doc"), ContentType::Json)
+            .await
+            .unwrap();
+        assert_eq!(node1.id().0, "lazy-doc");
+        assert_eq!(registry.node_count().await, 1);
+
+        // Second call should return existing
+        let node2 = registry
+            .get_or_create_document(&NodeId::new("lazy-doc"), ContentType::Text)
+            .await
+            .unwrap();
+        assert_eq!(node2.id().0, "lazy-doc");
+        assert_eq!(registry.node_count().await, 1); // Still just 1 node
     }
 }

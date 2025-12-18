@@ -1,5 +1,5 @@
-use super::subscription::Subscription;
-use super::types::{Edit, Event, NodeError, NodeId, NodeMessage};
+use super::subscription::{BlueSubscription, RedSubscription, Subscription};
+use super::types::{Edit, Event, NodeError, NodeId};
 use super::{Node, ObservableNode};
 use crate::document::ContentType;
 use async_trait::async_trait;
@@ -11,14 +11,17 @@ use yrs::{GetString, Transact, WriteTxn};
 
 /// Configuration for DocumentNode
 pub struct DocumentNodeConfig {
-    /// Broadcast channel capacity for subscribers
-    pub channel_capacity: usize,
+    /// Broadcast channel capacity for blue port (edits)
+    pub blue_channel_capacity: usize,
+    /// Broadcast channel capacity for red port (events)
+    pub red_channel_capacity: usize,
 }
 
 impl Default for DocumentNodeConfig {
     fn default() -> Self {
         Self {
-            channel_capacity: 256,
+            blue_channel_capacity: 256,
+            red_channel_capacity: 256,
         }
     }
 }
@@ -30,12 +33,18 @@ struct DocumentState {
     ydoc: yrs::Doc,
 }
 
-/// A node wrapping a single document with Yjs CRDT support
+/// A node wrapping a single document with Yjs CRDT support.
+///
+/// DocumentNode has two ports:
+/// - **Blue port**: Emits edits (Yjs commits) when the document changes
+/// - **Red port**: Emits events (ephemeral JSON) forwarded from receive_event
 pub struct DocumentNode {
     id: NodeId,
     state: RwLock<DocumentState>,
-    /// Broadcast channel for emitting messages to subscribers
-    tx: broadcast::Sender<NodeMessage>,
+    /// Blue channel for edits (persistent commits)
+    blue_tx: broadcast::Sender<Edit>,
+    /// Red channel for events (ephemeral)
+    red_tx: broadcast::Sender<Event>,
     /// Shutdown flag
     is_shutdown: AtomicBool,
 }
@@ -56,7 +65,8 @@ impl DocumentNode {
         content_type: ContentType,
         config: DocumentNodeConfig,
     ) -> Self {
-        let (tx, _rx) = broadcast::channel(config.channel_capacity);
+        let (blue_tx, _) = broadcast::channel(config.blue_channel_capacity);
+        let (red_tx, _) = broadcast::channel(config.red_channel_capacity);
 
         let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
         // Initialize the appropriate Yrs root type
@@ -81,7 +91,8 @@ impl DocumentNode {
         Self {
             id: NodeId::new(id),
             state: RwLock::new(state),
-            tx,
+            blue_tx,
+            red_tx,
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -143,10 +154,16 @@ impl DocumentNode {
         }
     }
 
-    /// Emit a message to all subscribers
-    fn emit(&self, message: NodeMessage) {
+    /// Emit an edit to blue port subscribers
+    fn emit_edit(&self, edit: Edit) {
         // Ignore send errors (no subscribers)
-        let _ = self.tx.send(message);
+        let _ = self.blue_tx.send(edit);
+    }
+
+    /// Emit an event to red port subscribers
+    fn emit_event(&self, event: Event) {
+        // Ignore send errors (no subscribers)
+        let _ = self.red_tx.send(event);
     }
 }
 
@@ -172,12 +189,12 @@ impl Node for DocumentNode {
         // Apply the update
         self.apply_update(&update_bytes).await?;
 
-        // Re-emit the edit to our subscribers (with our ID as the new source)
+        // Re-emit the edit to blue port subscribers (with our ID as the new source)
         let outgoing_edit = Edit {
             commit: edit.commit,
             source: self.id.clone(),
         };
-        self.emit(NodeMessage::Edit(outgoing_edit));
+        self.emit_edit(outgoing_edit);
 
         Ok(())
     }
@@ -187,21 +204,37 @@ impl Node for DocumentNode {
             return Err(NodeError::Shutdown);
         }
 
-        // Forward events to subscribers (documents don't interpret events)
+        // Forward events to red port subscribers (documents don't interpret events)
         let outgoing_event = Event {
             source: self.id.clone(),
             ..event
         };
-        self.emit(NodeMessage::Event(outgoing_event));
+        self.emit_event(outgoing_event);
         Ok(())
     }
 
-    fn subscribe(&self) -> Subscription {
-        Subscription::new(self.id.clone(), self.tx.subscribe())
+    fn subscribe_blue(&self) -> BlueSubscription {
+        BlueSubscription::new(self.id.clone(), self.blue_tx.subscribe())
     }
 
-    fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
+    fn subscribe_red(&self) -> RedSubscription {
+        RedSubscription::new(self.id.clone(), self.red_tx.subscribe())
+    }
+
+    fn subscribe(&self) -> Subscription {
+        Subscription::new(
+            self.id.clone(),
+            self.blue_tx.subscribe(),
+            self.red_tx.subscribe(),
+        )
+    }
+
+    fn blue_subscriber_count(&self) -> usize {
+        self.blue_tx.receiver_count()
+    }
+
+    fn red_subscriber_count(&self) -> usize {
+        self.red_tx.receiver_count()
     }
 
     async fn shutdown(&self) -> Result<(), NodeError> {
@@ -269,12 +302,20 @@ mod tests {
     #[tokio::test]
     async fn test_document_node_subscription() {
         let node = DocumentNode::new("test-doc", ContentType::Text);
-        assert_eq!(node.subscriber_count(), 0);
+        assert_eq!(node.blue_subscriber_count(), 0);
+        assert_eq!(node.red_subscriber_count(), 0);
 
-        let _sub1 = node.subscribe();
-        assert_eq!(node.subscriber_count(), 1);
+        let _blue_sub = node.subscribe_blue();
+        assert_eq!(node.blue_subscriber_count(), 1);
+        assert_eq!(node.red_subscriber_count(), 0);
 
-        let _sub2 = node.subscribe();
-        assert_eq!(node.subscriber_count(), 2);
+        let _red_sub = node.subscribe_red();
+        assert_eq!(node.blue_subscriber_count(), 1);
+        assert_eq!(node.red_subscriber_count(), 1);
+
+        // Combined subscription adds to both counts
+        let _combined = node.subscribe();
+        assert_eq!(node.blue_subscriber_count(), 2);
+        assert_eq!(node.red_subscriber_count(), 2);
     }
 }
