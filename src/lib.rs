@@ -2,9 +2,11 @@ pub mod api;
 pub mod b64;
 pub mod cli;
 pub mod commit;
+pub mod diff;
 pub mod document;
 pub mod events;
 pub mod node;
+pub mod replay;
 pub mod sse;
 pub mod store;
 

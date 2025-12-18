@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::commit::Commit;
+use crate::diff::compute_diff_update;
 use crate::document::{ContentType, DocumentStore};
 use crate::events::{CommitBroadcaster, CommitNotification};
 use crate::node::{DocumentNode, Edit, Event, NodeError, NodeId, NodeRegistry};
+use crate::replay::CommitReplayer;
 use crate::store::CommitStore;
 use crate::{b64, document::ApplyError};
 
@@ -64,6 +66,7 @@ pub fn router(
         .route("/nodes/:id", get(get_node))
         .route("/nodes/:id", delete(delete_node))
         .route("/nodes/:id/edit", post(send_edit))
+        .route("/nodes/:id/replace", post(replace_content))
         .route("/nodes/:id/event", post(send_event))
         .route("/nodes/:from/wire/:to", post(wire_nodes))
         .route("/nodes/:from/wire/:to", delete(unwire_nodes))
@@ -458,16 +461,48 @@ async fn send_edit(
     Path(id): Path<String>,
     Json(req): Json<SendEditRequest>,
 ) -> Result<Json<SendEditResponse>, StatusCode> {
-    let node_id = NodeId::new(id);
+    let node_id = NodeId::new(id.clone());
     let node = state
         .node_registry
         .get(&node_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Determine parents - use provided or get current head
+    let parents = if req.parents.is_empty() {
+        // If no parents specified, use current head (if any)
+        if let Some(commit_store) = &state.commit_store {
+            commit_store
+                .get_document_head(&id)
+                .await
+                .ok()
+                .flatten()
+                .map(|h| vec![h])
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        req.parents
+    };
+
     let author = req.author.unwrap_or_else(|| "anonymous".to_string());
-    let commit = Commit::new(req.parents, req.update, author, req.message);
+    let commit = Commit::new(parents, req.update, author, req.message);
     let cid = commit.calculate_cid();
+
+    // Store commit in commit store if available
+    if let Some(commit_store) = &state.commit_store {
+        commit_store
+            .store_commit(&commit)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Set as new document head
+        commit_store
+            .set_document_head(&id, &cid)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     let edit = Edit {
         commit: Arc::new(commit),
@@ -567,4 +602,197 @@ async fn unwire_nodes(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
+// Replace content endpoint
+// ============================================================================
+
+/// Query parameters for replace endpoint
+#[derive(Deserialize)]
+struct ReplaceQuery {
+    /// Commit we're editing from (must exist in history)
+    parent_cid: String,
+    /// Author identifier (optional, defaults to "anonymous")
+    #[serde(default)]
+    author: Option<String>,
+    /// Optional commit message
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReplaceResponse {
+    /// The commit that HEAD now points to (merge_cid if merge occurred, else edit_cid)
+    cid: String,
+    /// The edit commit CID (may equal cid if no merge was needed)
+    edit_cid: String,
+    /// Summary of changes applied
+    summary: ReplaceSummary,
+}
+
+#[derive(Serialize)]
+struct ReplaceSummary {
+    chars_inserted: usize,
+    chars_deleted: usize,
+    operations: usize,
+}
+
+async fn replace_content(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReplaceQuery>,
+    body: String,
+) -> Result<Json<ReplaceResponse>, (StatusCode, String)> {
+    // 1. Check commit store is available
+    let commit_store = state
+        .commit_store
+        .as_ref()
+        .ok_or((
+            StatusCode::NOT_IMPLEMENTED,
+            "Commit store not enabled. Start server with --database flag.".to_string(),
+        ))?;
+
+    // 2. Verify node exists
+    let node_id = NodeId::new(&id);
+    let node = state
+        .node_registry
+        .get(&node_id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", id)))?;
+
+    // 3. Only support text content type for now
+    let content_type = ContentType::Text;
+
+    // 4. Validate parent_cid exists in document history
+    let replayer = CommitReplayer::new(commit_store.as_ref());
+
+    if !replayer
+        .verify_commit_in_history(&id, &query.parent_cid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Commit {} not found in document history", query.parent_cid),
+        ));
+    }
+
+    // 5. Reconstruct content at parent_cid
+    let old_content = replayer
+        .get_content_at_commit(&id, &query.parent_cid, &content_type)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 6. Compute diff and generate Yjs update
+    let diff_result = compute_diff_update(&old_content, &body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 7. Get current HEAD
+    let current_head = commit_store
+        .get_document_head(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let author = query.author.unwrap_or_else(|| "anonymous".to_string());
+
+    // 8. Create edit commit
+    let edit_commit = Commit::new(
+        vec![query.parent_cid.clone()],
+        diff_result.update_b64.clone(),
+        author.clone(),
+        query.message.clone(),
+    );
+    let edit_cid = commit_store
+        .store_commit(&edit_commit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 9. Determine if merge is needed and apply update
+    let merge_cid = if current_head.as_ref() == Some(&query.parent_cid) {
+        // Fast-forward: parent_cid == HEAD, no merge needed
+        // Apply update to node
+        let edit = Edit {
+            commit: Arc::new(edit_commit),
+            source: NodeId::new("api"),
+        };
+        node.receive_edit(edit).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to apply edit: {}", e),
+            )
+        })?;
+
+        // Update HEAD
+        commit_store
+            .set_document_head(&id, &edit_cid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        None
+    } else if let Some(head_cid) = current_head {
+        // Need merge: parent_cid != HEAD
+        let merge_commit = Commit::new(
+            vec![edit_cid.clone(), head_cid],
+            String::new(), // Empty update for merge (CRDT handles convergence)
+            author,
+            Some("Merge commit".to_string()),
+        );
+        let merge_cid = commit_store
+            .store_commit(&merge_commit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        // Apply update to node
+        let edit = Edit {
+            commit: Arc::new(edit_commit),
+            source: NodeId::new("api"),
+        };
+        node.receive_edit(edit).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to apply edit: {}", e),
+            )
+        })?;
+
+        // Update HEAD to merge commit
+        commit_store
+            .set_document_head(&id, &merge_cid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        Some(merge_cid)
+    } else {
+        // No HEAD yet - this is the first commit for this document
+        let edit = Edit {
+            commit: Arc::new(edit_commit),
+            source: NodeId::new("api"),
+        };
+        node.receive_edit(edit).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to apply edit: {}", e),
+            )
+        })?;
+
+        commit_store
+            .set_document_head(&id, &edit_cid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        None
+    };
+
+    // cid is what HEAD points to (merge if exists, else edit)
+    let head_cid = merge_cid.unwrap_or_else(|| edit_cid.clone());
+
+    Ok(Json(ReplaceResponse {
+        cid: head_cid,
+        edit_cid,
+        summary: ReplaceSummary {
+            chars_inserted: diff_result.summary.chars_inserted,
+            chars_deleted: diff_result.summary.chars_deleted,
+            operations: diff_result.operation_count,
+        },
+    }))
 }

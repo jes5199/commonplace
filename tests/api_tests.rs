@@ -560,3 +560,234 @@ async fn test_xml_document_yjs_commit_updates_document_body() {
         r#"<?xml version="1.0" encoding="UTF-8"?><root><hello>world</hello></root>"#
     );
 }
+
+// ============================================================================
+// Replace endpoint integration tests
+// ============================================================================
+
+/// Helper to create a text node and return its ID
+async fn create_text_node(app: &axum::Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/nodes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "node_type": "document",
+                        "content_type": "text/plain"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    json["id"].as_str().unwrap().to_string()
+}
+
+/// Helper to send an edit (Yjs update) to a node and get the commit CID
+async fn send_edit(app: &axum::Router, node_id: &str, update_b64: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/edit", node_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "update": update_b64,
+                        "author": "test"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    json["cid"].as_str().unwrap().to_string()
+}
+
+/// Helper to create a Yjs text update
+fn create_yjs_text_update(text: &str) -> String {
+    let ydoc = yrs::Doc::new();
+    let ytext = ydoc.get_or_insert_text("content");
+    let mut txn = ydoc.transact_mut();
+    ytext.push(&mut txn, text);
+    commonplace_doc::b64::encode(&txn.encode_update_v1())
+}
+
+#[tokio::test]
+async fn test_replace_content_basic() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text node
+    let node_id = create_text_node(&app).await;
+
+    // Initialize with "hello world"
+    let initial_update = create_yjs_text_update("hello world");
+    let cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Replace with "hello rust" - using query params and raw body
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    node_id, cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("hello rust"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Verify response structure
+    assert!(json["cid"].is_string());
+    assert!(json["edit_cid"].is_string());
+    assert!(json["summary"]["chars_deleted"].is_number());
+    assert!(json["summary"]["chars_inserted"].is_number());
+
+    // For fast-forward case, cid == edit_cid (no merge needed)
+    assert_eq!(json["cid"], json["edit_cid"]);
+}
+
+#[tokio::test]
+async fn test_replace_content_no_change() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Initialize with "hello"
+    let initial_update = create_yjs_text_update("hello");
+    let cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Replace with identical content
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    node_id, cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Should have zero changes
+    assert_eq!(json["summary"]["chars_deleted"].as_i64().unwrap(), 0);
+    assert_eq!(json["summary"]["chars_inserted"].as_i64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_replace_content_complete_rewrite() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Initialize with some content
+    let initial_update = create_yjs_text_update("old content here");
+    let cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Complete rewrite
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    node_id, cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("completely new text"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Verify significant changes occurred
+    assert!(json["summary"]["chars_deleted"].as_i64().unwrap() > 0);
+    assert!(json["summary"]["chars_inserted"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_replace_nonexistent_node() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/nodes/nonexistent-node/replace?parent_cid=some-cid&author=test")
+                .header("content-type", "text/plain")
+                .body(Body::from("new content"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_replace_invalid_parent_cid() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Initialize with some content
+    let initial_update = create_yjs_text_update("hello");
+    let _cid = send_edit(&app, &node_id, &initial_update).await;
+
+    // Try to replace with invalid parent_cid
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid=invalid-cid-that-does-not-exist&author=test",
+                    node_id
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("new content"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
