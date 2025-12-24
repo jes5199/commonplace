@@ -27,13 +27,21 @@ struct Args {
     #[arg(short, long, default_value = "http://localhost:3000")]
     server: String,
 
-    /// Node ID to sync with
+    /// Node ID to sync with (optional if --fork-from is provided)
     #[arg(short, long)]
-    node: String,
+    node: Option<String>,
 
     /// Local file path to sync
     #[arg(short, long)]
     file: PathBuf,
+
+    /// Fork from this node before syncing (creates a new node)
+    #[arg(long)]
+    fork_from: Option<String>,
+
+    /// When forking, use this commit instead of HEAD
+    #[arg(long, requires = "fork_from")]
+    at_commit: Option<String>,
 }
 
 /// Shared state between file watcher and SSE tasks
@@ -112,6 +120,13 @@ struct EditResponse {
     cid: String,
 }
 
+/// Response from POST /nodes/:id/fork
+#[derive(Debug, Deserialize)]
+struct ForkResponse {
+    id: String,
+    head: String,
+}
+
 /// File watcher events
 #[derive(Debug)]
 enum FileEvent {
@@ -139,6 +154,37 @@ fn base64_encode(data: &[u8]) -> String {
     STANDARD.encode(data)
 }
 
+/// Fork a source node and return the new node ID
+async fn fork_node(
+    client: &Client,
+    server: &str,
+    source_node: &str,
+    at_commit: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut fork_url = format!("{}/nodes/{}/fork", server, source_node);
+    if let Some(commit) = at_commit {
+        fork_url = format!("{}?at_commit={}", fork_url, commit);
+    }
+
+    let resp = client.post(&fork_url).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Fork failed: {} - {}", status, body).into());
+    }
+
+    let fork_response: ForkResponse = resp.json().await?;
+    info!(
+        "Forked node {} -> {} (at commit {})",
+        source_node,
+        fork_response.id,
+        &fork_response.head[..8.min(fork_response.head.len())]
+    );
+
+    Ok(fork_response.id)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -151,30 +197,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    info!(
-        "Starting commonplace-sync: server={}, node={}, file={}",
-        args.server,
-        args.node,
-        args.file.display()
-    );
-
     // Create HTTP client
     let client = Client::new();
 
+    // Determine the node ID to sync with
+    let node_id = match (&args.node, &args.fork_from) {
+        (Some(node), None) => {
+            // Direct sync to existing node
+            node.clone()
+        }
+        (None, Some(source)) => {
+            // Fork first, then sync to new node
+            info!("Forking from node {}...", source);
+            fork_node(&client, &args.server, source, args.at_commit.as_deref()).await?
+        }
+        (Some(node), Some(source)) => {
+            // Both provided - use --node but warn
+            warn!(
+                "--node and --fork-from both provided; using --node={} (ignoring --fork-from={})",
+                node, source
+            );
+            node.clone()
+        }
+        (None, None) => {
+            error!("Either --node or --fork-from must be provided");
+            return Err("Either --node or --fork-from must be provided".into());
+        }
+    };
+
+    info!(
+        "Starting commonplace-sync: server={}, node={}, file={}",
+        args.server,
+        node_id,
+        args.file.display()
+    );
+
     // Verify node exists
-    let node_url = format!("{}/nodes/{}", args.server, args.node);
+    let node_url = format!("{}/nodes/{}", args.server, node_id);
     let resp = client.get(&node_url).send().await?;
     if !resp.status().is_success() {
-        error!("Node {} not found on server", args.node);
-        return Err(format!("Node {} not found", args.node).into());
+        error!("Node {} not found on server", node_id);
+        return Err(format!("Node {} not found", node_id).into());
     }
-    info!("Connected to node {}", args.node);
+    info!("Connected to node {}", node_id);
 
     // Initialize shared state
     let state = Arc::new(RwLock::new(SyncState::new()));
 
     // Perform initial sync
-    initial_sync(&client, &args, &state).await?;
+    initial_sync(&client, &args.server, &node_id, &args.file, &state).await?;
 
     // Create channel for file events
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
@@ -189,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upload_handle = tokio::spawn(upload_task(
         client.clone(),
         args.server.clone(),
-        args.node.clone(),
+        node_id.clone(),
         args.file.clone(),
         state.clone(),
         file_rx,
@@ -199,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sse_handle = tokio::spawn(sse_task(
         client.clone(),
         args.server.clone(),
-        args.node.clone(),
+        node_id.clone(),
         args.file.clone(),
         state.clone(),
     ));
@@ -220,10 +291,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Perform initial sync: fetch HEAD and write to local file
 async fn initial_sync(
     client: &Client,
-    args: &Args,
+    server: &str,
+    node_id: &str,
+    file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/nodes/{}/head", args.server, args.node);
+    let head_url = format!("{}/nodes/{}/head", server, node_id);
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -233,7 +306,7 @@ async fn initial_sync(
     let head: HeadResponse = resp.json().await?;
 
     // Write content to file
-    tokio::fs::write(&args.file, &head.content).await?;
+    tokio::fs::write(file_path, &head.content).await?;
 
     // Update state
     {
