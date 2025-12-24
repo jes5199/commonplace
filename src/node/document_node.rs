@@ -3,11 +3,12 @@ use super::types::{Edit, Event, NodeError, NodeId};
 use super::{Node, ObservableNode};
 use crate::document::ContentType;
 use async_trait::async_trait;
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, RwLock};
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
-use yrs::{GetString, Transact, WriteTxn};
+use yrs::{GetString, Text, Transact, WriteTxn};
 
 /// Configuration for DocumentNode
 pub struct DocumentNodeConfig {
@@ -165,6 +166,48 @@ impl DocumentNode {
         // Ignore send errors (no subscribers)
         let _ = self.red_tx.send(event);
     }
+
+    /// Get the content type of this document
+    pub fn content_type(&self) -> ContentType {
+        // Safe to block briefly since we only read
+        futures::executor::block_on(async { self.state.read().await.content_type.clone() })
+    }
+
+    /// Set the content of this document (for forking) - DEPRECATED
+    /// Use apply_state instead to preserve CRDT structure.
+    pub fn set_content(&self, content: &str) {
+        futures::executor::block_on(async {
+            let mut state = self.state.write().await;
+
+            // Only support text content type for now
+            if matches!(state.content_type, ContentType::Text) {
+                {
+                    let text = state.ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+                    let mut txn = state.ydoc.transact_mut();
+
+                    // Clear existing content
+                    let len = text.len(&txn);
+                    if len > 0 {
+                        text.remove_range(&mut txn, 0, len);
+                    }
+
+                    // Insert new content
+                    text.insert(&mut txn, 0, content);
+                    // txn is committed when dropped here
+                }
+                state.content = content.to_string();
+            }
+        })
+    }
+
+    /// Apply Yjs state bytes to this document (for forking with CRDT consistency)
+    ///
+    /// This applies a full state update (from encode_state_as_update_v1) to the
+    /// document, preserving CRDT structure so that future edits are compatible
+    /// with the source document's commit history.
+    pub fn apply_state(&self, state_bytes: &[u8]) -> Result<String, NodeError> {
+        futures::executor::block_on(async { self.apply_update(state_bytes).await })
+    }
 }
 
 #[async_trait]
@@ -244,6 +287,10 @@ impl Node for DocumentNode {
 
     fn is_healthy(&self) -> bool {
         !self.is_shutdown.load(Ordering::Relaxed)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

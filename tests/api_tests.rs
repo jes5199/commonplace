@@ -411,7 +411,10 @@ async fn test_text_document_yjs_commit_updates_document_body() {
         .unwrap();
 
     assert_eq!(get_response.status(), StatusCode::OK);
-    assert_eq!(get_response.headers().get("content-type").unwrap(), "text/plain");
+    assert_eq!(
+        get_response.headers().get("content-type").unwrap(),
+        "text/plain"
+    );
     let body = body_to_string(get_response.into_body()).await;
     assert_eq!(body, "hello");
 }
@@ -921,4 +924,393 @@ async fn test_get_node_head_nonexistent_node() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ============================================================================
+// Fork endpoint integration tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_fork_at_head_creates_new_doc_with_same_content() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    // Create a text node and add content
+    let node_id = create_text_node(&app).await;
+    let update = create_yjs_text_update("hello world");
+    let _cid = send_edit(&app, &node_id, &update).await;
+
+    // Fork at HEAD (no at_commit param)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/fork", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Should return new node ID
+    let fork_id = json["id"].as_str().unwrap();
+    assert_ne!(fork_id, node_id);
+
+    // Verify forked doc has same content
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", fork_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_body = body_to_string(get_response.into_body()).await;
+    let get_json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+    assert_eq!(get_json["content"].as_str().unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn test_fork_shares_commit_history() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+    let update = create_yjs_text_update("hello");
+    let original_cid = send_edit(&app, &node_id, &update).await;
+
+    // Fork the node
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/fork", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let fork_id = json["id"].as_str().unwrap();
+
+    // Forked doc should have same HEAD CID as original
+    assert_eq!(json["head"].as_str().unwrap(), original_cid);
+
+    // Verify both docs point to the same commit
+    let original_head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let original_head_body = body_to_string(original_head.into_body()).await;
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
+
+    let fork_head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", fork_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fork_head_body = body_to_string(fork_head.into_body()).await;
+    let fork_head_json: serde_json::Value = serde_json::from_str(&fork_head_body).unwrap();
+
+    assert_eq!(
+        original_head_json["cid"].as_str().unwrap(),
+        fork_head_json["cid"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_fork_at_historical_commit() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+
+    // Create first commit
+    let update1 = create_yjs_text_update("version one");
+    let cid1 = send_edit(&app, &node_id, &update1).await;
+
+    // Create second commit (replaces content)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    node_id, cid1
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("version two"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Fork at the FIRST commit (historical)
+    let fork_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/fork?at_commit={}", node_id, cid1))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fork_response.status(), StatusCode::OK);
+    let fork_body = body_to_string(fork_response.into_body()).await;
+    let fork_json: serde_json::Value = serde_json::from_str(&fork_body).unwrap();
+    let fork_id = fork_json["id"].as_str().unwrap();
+
+    // Fork should have content from version one
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", fork_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let get_body = body_to_string(get_response.into_body()).await;
+    let get_json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+    assert_eq!(get_json["content"].as_str().unwrap(), "version one");
+    assert_eq!(get_json["cid"].as_str().unwrap(), cid1);
+}
+
+#[tokio::test]
+async fn test_forked_doc_can_commit_independently() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+    let update = create_yjs_text_update("original");
+    let original_cid = send_edit(&app, &node_id, &update).await;
+
+    // Fork the node
+    let fork_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/fork", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fork_body = body_to_string(fork_response.into_body()).await;
+    let fork_json: serde_json::Value = serde_json::from_str(&fork_body).unwrap();
+    let fork_id = fork_json["id"].as_str().unwrap();
+
+    // Commit to the fork
+    let replace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    fork_id, original_cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("forked content"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replace_response.status(), StatusCode::OK);
+
+    // Verify fork has new content
+    let fork_head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", fork_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fork_head_body = body_to_string(fork_head.into_body()).await;
+    let fork_head_json: serde_json::Value = serde_json::from_str(&fork_head_body).unwrap();
+    assert_eq!(
+        fork_head_json["content"].as_str().unwrap(),
+        "forked content"
+    );
+
+    // Original should still have old content
+    let original_head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let original_head_body = body_to_string(original_head.into_body()).await;
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
+    assert_eq!(original_head_json["content"].as_str().unwrap(), "original");
+}
+
+#[tokio::test]
+async fn test_fork_nonexistent_node_returns_404() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/nodes/nonexistent-node/fork")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_fork_at_invalid_cid_returns_error() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+    let update = create_yjs_text_update("hello");
+    let _cid = send_edit(&app, &node_id, &update).await;
+
+    // Fork at invalid commit
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/fork?at_commit=invalid-cid-does-not-exist",
+                    node_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_commits_to_fork_dont_affect_original() {
+    let (app, _dir) = create_app_with_commit_store();
+
+    let node_id = create_text_node(&app).await;
+    let update = create_yjs_text_update("shared base");
+    let base_cid = send_edit(&app, &node_id, &update).await;
+
+    // Fork the node
+    let fork_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/nodes/{}/fork", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fork_body = body_to_string(fork_response.into_body()).await;
+    let fork_json: serde_json::Value = serde_json::from_str(&fork_body).unwrap();
+    let fork_id = fork_json["id"].as_str().unwrap();
+
+    // Make multiple commits to fork
+    let replace1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    fork_id, base_cid
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("fork edit 1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let replace1_body = body_to_string(replace1.into_body()).await;
+    let replace1_json: serde_json::Value = serde_json::from_str(&replace1_body).unwrap();
+    let fork_cid1 = replace1_json["cid"].as_str().unwrap();
+
+    let _replace2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/nodes/{}/replace?parent_cid={}&author=test",
+                    fork_id, fork_cid1
+                ))
+                .header("content-type", "text/plain")
+                .body(Body::from("fork edit 2"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Original should still be at base
+    let original_head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/nodes/{}/head", node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let original_head_body = body_to_string(original_head.into_body()).await;
+    let original_head_json: serde_json::Value = serde_json::from_str(&original_head_body).unwrap();
+
+    assert_eq!(original_head_json["cid"].as_str().unwrap(), base_cid);
+    assert_eq!(
+        original_head_json["content"].as_str().unwrap(),
+        "shared base"
+    );
 }
