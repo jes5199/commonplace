@@ -69,6 +69,7 @@ pub fn router(
         .route("/nodes/:id/replace", post(replace_content))
         .route("/nodes/:id/head", get(get_node_head))
         .route("/nodes/:id/event", post(send_event))
+        .route("/nodes/:id/fork", post(fork_node))
         .route("/nodes/:from/wire/:to", post(wire_nodes))
         .route("/nodes/:from/wire/:to", delete(unwire_nodes))
         .with_state(state)
@@ -848,5 +849,113 @@ async fn replace_content(
             chars_deleted: diff_result.summary.chars_deleted,
             operations: diff_result.operation_count,
         },
+    }))
+}
+
+// ============================================================================
+// Fork endpoint
+// ============================================================================
+
+/// Query parameters for fork endpoint
+#[derive(Deserialize)]
+struct ForkQuery {
+    /// Optional commit to fork from. If not specified, uses current HEAD.
+    #[serde(default)]
+    at_commit: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ForkResponse {
+    /// New node ID
+    id: String,
+    /// HEAD commit of the forked node (same as source at fork point)
+    head: String,
+}
+
+async fn fork_node(
+    State(state): State<ApiState>,
+    Path(source_id): Path<String>,
+    Query(query): Query<ForkQuery>,
+) -> Result<Json<ForkResponse>, (StatusCode, String)> {
+    // 1. Check commit store is available
+    let commit_store = state.commit_store.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Commit store not enabled. Start server with --database flag.".to_string(),
+    ))?;
+
+    // 2. Verify source node exists and get its content type
+    let source_node_id = NodeId::new(&source_id);
+    let source_node = state
+        .node_registry
+        .get(&source_node_id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, format!("Node {} not found", source_id)))?;
+
+    // Get content type from the source node (DocumentNode stores it)
+    let content_type = source_node
+        .as_any()
+        .downcast_ref::<DocumentNode>()
+        .map(|dn| dn.content_type())
+        .unwrap_or(ContentType::Text);
+
+    // 3. Determine which commit to fork from
+    let fork_cid = match query.at_commit {
+        Some(cid) => {
+            // Validate the specified commit exists
+            commit_store
+                .get_commit(&cid)
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("not found") {
+                        (StatusCode::BAD_REQUEST, format!("Commit {} not found", cid))
+                    } else {
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    }
+                })?;
+            cid
+        }
+        None => {
+            // Use current HEAD
+            commit_store
+                .get_document_head(&source_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "Source node has no commits to fork from".to_string(),
+                ))?
+        }
+    };
+
+    // 4. Create new node with new UUID
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let new_node = Arc::new(DocumentNode::new(new_id.clone(), content_type.clone()));
+
+    // 5. Register the new node
+    state
+        .node_registry
+        .register(new_node.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 6. Replay content at fork point and apply to new node
+    let replayer = CommitReplayer::new(commit_store.as_ref());
+    let (content, _state) = replayer
+        .get_content_and_state_at_commit(&source_id, &fork_cid, &content_type)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Apply content to the new node's Yjs doc
+    new_node.set_content(&content);
+
+    // 7. Set new node's HEAD to the same commit (shares the commit DAG)
+    commit_store
+        .set_document_head(&new_id, &fork_cid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ForkResponse {
+        id: new_id,
+        head: fork_cid,
     }))
 }

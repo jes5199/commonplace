@@ -2,6 +2,7 @@ use super::subscription::{BlueSubscription, RedSubscription, Subscription};
 use super::types::{Edit, Event, NodeError, NodeId};
 use super::Node;
 use async_trait::async_trait;
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -149,6 +150,10 @@ impl Node for ConnectionNode {
 
     fn is_healthy(&self) -> bool {
         !self.is_shutdown.load(Ordering::Relaxed)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

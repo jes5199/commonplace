@@ -5,6 +5,7 @@ pub mod subscription;
 pub mod types;
 
 use async_trait::async_trait;
+use std::any::Any;
 
 pub use connection_node::ConnectionNode;
 pub use document_node::DocumentNode;
@@ -79,6 +80,9 @@ pub trait Node: Send + Sync {
 
     /// Check if the node is healthy and operational
     fn is_healthy(&self) -> bool;
+
+    /// Downcast to concrete type for type-specific operations
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Extension trait for nodes that can be observed for specific content
