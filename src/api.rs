@@ -941,27 +941,27 @@ async fn fork_node(
     let new_id = uuid::Uuid::new_v4().to_string();
     let new_node = Arc::new(DocumentNode::new(new_id.clone(), content_type.clone()));
 
-    // 5. Register the new node
-    state
-        .node_registry
-        .register(new_node.clone())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // 6. Replay Yjs state at fork point and apply to new node
+    // 5. Replay Yjs state at fork point and apply to new node
+    // (Do this BEFORE registering so failures don't leave orphan nodes)
     let (_content, state_bytes) = replayer
         .get_content_and_state_at_commit(&source_id, &fork_cid, &content_type)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Apply Yjs state to the new node (preserves CRDT structure for future edits)
     new_node
         .apply_state(&state_bytes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 7. Set new node's HEAD to the same commit (shares the commit DAG)
+    // 6. Set new node's HEAD to the same commit (shares the commit DAG)
     commit_store
         .set_document_head(&new_id, &fork_cid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 7. Register the new node (only after state and head are set successfully)
+    state
+        .node_registry
+        .register(new_node.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
