@@ -239,24 +239,30 @@ impl FilesystemReconciler {
     }
 
     /// Update watchers for node-backed directories.
-    /// Aborts old watchers and starts fresh ones to handle node recreation.
-    /// Only triggers a post-restart reconcile if the watcher set changed.
+    /// Only restarts watchers that actually changed to avoid coverage gaps.
+    /// Triggers a post-restart reconcile only when the watcher set changes.
     async fn update_dir_watchers(self: &Arc<Self>, discovered: HashSet<String>) {
         let mut handles = self.watcher_handles.write().await;
 
-        // Check if watcher set changed (need post-restart reconcile if so)
+        // Compute differences: what to add, what to remove
         let old_dirs: HashSet<String> = handles.keys().cloned().collect();
-        let watcher_set_changed = old_dirs != discovered;
+        let to_add: HashSet<_> = discovered.difference(&old_dirs).cloned().collect();
+        let to_remove: HashSet<_> = old_dirs.difference(&discovered).cloned().collect();
 
-        // Abort all old watchers - they may be subscribed to stale nodes
-        for (_, handle) in handles.drain() {
-            handle.abort();
+        let watcher_set_changed = !to_add.is_empty() || !to_remove.is_empty();
+
+        // Remove watchers for directories no longer in the set
+        for dir_id in &to_remove {
+            if let Some(handle) = handles.remove(dir_id) {
+                handle.abort();
+                tracing::debug!("Stopped watching node-backed dir: {}", dir_id);
+            }
         }
 
-        // Start fresh watchers for all discovered node-backed dirs
-        for dir_id in &discovered {
+        // Add watchers for new directories
+        for dir_id in to_add {
             let reconciler = self.clone();
-            let node_id = NodeId::new(dir_id);
+            let node_id = NodeId::new(&dir_id);
             let dir_id_for_handle = dir_id.clone();
 
             let handle = tokio::spawn(async move {
@@ -297,7 +303,7 @@ impl FilesystemReconciler {
         drop(handles);
 
         // Only trigger post-restart reconcile if watcher set changed
-        // (avoids infinite loop when watchers are restarted with same set)
+        // (avoids infinite loop when watchers are unchanged)
         if watcher_set_changed {
             if let Some(ref tx) = *self.reconcile_trigger.read().await {
                 let _ = tx.send(()).await;
