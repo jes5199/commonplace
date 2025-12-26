@@ -24,8 +24,8 @@ pub struct FilesystemReconciler {
     last_valid_schema: RwLock<Option<FsSchema>>,
     /// Set of node IDs we've already created
     known_nodes: RwLock<HashSet<String>>,
-    /// Set of node-backed directory IDs we're watching
-    watched_dirs: RwLock<HashSet<String>>,
+    /// Active watcher tasks for node-backed directories (node_id -> JoinHandle)
+    watcher_handles: RwLock<std::collections::HashMap<String, JoinHandle<()>>>,
     /// Channel sender to trigger reconciliation (None until start() is called)
     reconcile_trigger: RwLock<Option<mpsc::Sender<()>>>,
 }
@@ -38,7 +38,7 @@ impl FilesystemReconciler {
             registry,
             last_valid_schema: RwLock::new(None),
             known_nodes: RwLock::new(HashSet::new()),
-            watched_dirs: RwLock::new(HashSet::new()),
+            watcher_handles: RwLock::new(std::collections::HashMap::new()),
             reconcile_trigger: RwLock::new(None),
         }
     }
@@ -177,22 +177,22 @@ impl FilesystemReconciler {
     }
 
     /// Update watchers for node-backed directories.
-    /// Always (re)starts watchers for discovered dirs to handle node recreation.
+    /// Aborts old watchers and starts fresh ones to handle node recreation.
     async fn update_dir_watchers(self: &Arc<Self>, discovered: HashSet<String>) {
-        // Clear watched_dirs and restart all watchers on each reconcile.
-        // This handles the case where a node was deleted and recreated -
-        // old watchers may be subscribed to stale node instances.
-        let mut watched = self.watched_dirs.write().await;
-        watched.clear();
+        let mut handles = self.watcher_handles.write().await;
 
+        // Abort all old watchers - they may be subscribed to stale nodes
+        for (_, handle) in handles.drain() {
+            handle.abort();
+        }
+
+        // Start fresh watchers for all discovered node-backed dirs
         for dir_id in discovered {
-            watched.insert(dir_id.clone());
-
             let reconciler = self.clone();
             let node_id = NodeId::new(&dir_id);
-            let dir_id_clone = dir_id.clone();
+            let dir_id_for_handle = dir_id.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Some(node) = reconciler.registry.get(&node_id).await {
                     let mut sub = node.subscribe_blue();
                     loop {
@@ -215,7 +215,6 @@ impl FilesystemReconciler {
                                     "node-backed dir {} closed, stopping watcher",
                                     node_id.0
                                 );
-                                reconciler.watched_dirs.write().await.remove(&dir_id_clone);
                                 break;
                             }
                         }
@@ -223,6 +222,7 @@ impl FilesystemReconciler {
                 }
             });
 
+            handles.insert(dir_id_for_handle, handle);
             tracing::debug!("Started watching node-backed dir: {}", dir_id);
         }
     }
@@ -236,6 +236,7 @@ impl FilesystemReconciler {
     }
 
     /// Reconcile current state: parse JSON, collect entries, create missing nodes.
+    /// Note: Uses cycle detection to prevent infinite recursion on cyclic node-backed dirs.
     pub async fn reconcile(&self, content: &str) -> Result<(), FsError> {
         // 1. Parse JSON
         let schema: FsSchema =
@@ -246,9 +247,12 @@ impl FilesystemReconciler {
             return Err(FsError::UnsupportedVersion(schema.version));
         }
 
-        // 3. Collect all entries from schema
+        // 3. Collect all entries from schema (with cycle detection)
+        let mut ignored_dirs = HashSet::new();
+        let mut recursion_stack = HashSet::new();
         let entries = if let Some(ref root) = schema.root {
-            self.collect_entries(root, "").await?
+            self.collect_entries_with_dirs(root, "", &mut ignored_dirs, &mut recursion_stack)
+                .await?
         } else {
             vec![]
         };
@@ -279,82 +283,6 @@ impl FilesystemReconciler {
         *self.last_valid_schema.write().await = Some(schema);
 
         Ok(())
-    }
-
-    /// Walk the entry tree, collecting all (path, resolved_node_id, content_type).
-    ///
-    /// For node-backed directories, recursively fetches and parses their content.
-    async fn collect_entries(
-        &self,
-        entry: &Entry,
-        current_path: &str,
-    ) -> Result<Vec<(String, String, ContentType)>, FsError> {
-        let mut results = vec![];
-
-        match entry {
-            Entry::Doc(doc) => {
-                let node_id = doc
-                    .node_id
-                    .clone()
-                    .unwrap_or_else(|| self.derive_node_id(current_path));
-                let content_type = doc
-                    .content_type
-                    .as_deref()
-                    .and_then(ContentType::from_mime)
-                    .unwrap_or(ContentType::Json);
-                results.push((current_path.to_string(), node_id, content_type));
-            }
-            Entry::Dir(dir) => {
-                // Spec: node-backed and inline forms are mutually exclusive
-                if dir.node_id.is_some() && dir.entries.is_some() {
-                    return Err(FsError::SchemaError(format!(
-                        "Directory at '{}' has both node_id and entries (mutually exclusive)",
-                        if current_path.is_empty() {
-                            "/"
-                        } else {
-                            current_path
-                        }
-                    )));
-                }
-
-                // Handle node-backed directory
-                if let Some(ref nid) = dir.node_id {
-                    let content_type = dir
-                        .content_type
-                        .as_deref()
-                        .and_then(ContentType::from_mime)
-                        .unwrap_or(ContentType::Json);
-
-                    // First, ensure the node exists
-                    results.push((current_path.to_string(), nid.clone(), content_type.clone()));
-
-                    // Then, try to recursively process its content
-                    if let Some(child_entries) = self
-                        .collect_node_backed_dir_entries(nid, current_path)
-                        .await
-                    {
-                        results.extend(child_entries);
-                    }
-                }
-
-                // Handle inline entries
-                if let Some(ref entries) = dir.entries {
-                    for (name, child) in entries {
-                        // Validate name
-                        Entry::validate_name(name)?;
-
-                        let child_path = if current_path.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}/{}", current_path, name)
-                        };
-                        results.extend(Box::pin(self.collect_entries(child, &child_path)).await?);
-                    }
-                }
-            }
-        }
-
-        Ok(results)
     }
 
     /// Walk the entry tree, collecting entries and tracking node-backed directory IDs.
@@ -467,63 +395,6 @@ impl FilesystemReconciler {
     }
 
     /// Try to fetch and parse a node-backed directory's content.
-    /// Returns None if the node doesn't exist yet or content is invalid.
-    /// Emits fs.error events for parse/schema errors so clients can debug.
-    async fn collect_node_backed_dir_entries(
-        &self,
-        node_id: &str,
-        base_path: &str,
-    ) -> Option<Vec<(String, String, ContentType)>> {
-        let nid = NodeId::new(node_id);
-
-        // Try to get existing node - not an error if it doesn't exist yet
-        let node = self.registry.get(&nid).await?;
-
-        // Try to get content - not an error if node isn't a document
-        let doc_node = node.as_any().downcast_ref::<DocumentNode>()?;
-        let content = match doc_node.get_content().await {
-            Ok(c) => c,
-            Err(_) => return None, // Content retrieval failure is not a schema error
-        };
-
-        // Empty content is not an error (node just hasn't been populated)
-        if content.is_empty() || content == "{}" {
-            return None;
-        }
-
-        // Try to parse as filesystem schema - emit error if invalid
-        let schema: FsSchema = match serde_json::from_str(&content) {
-            Ok(s) => s,
-            Err(e) => {
-                self.emit_error(FsError::ParseError(e.to_string()), Some(base_path))
-                    .await;
-                return None;
-            }
-        };
-
-        // Validate version - emit error if unsupported
-        if schema.version != 1 {
-            self.emit_error(FsError::UnsupportedVersion(schema.version), Some(base_path))
-                .await;
-            return None;
-        }
-
-        // Recursively collect from the nested root
-        if let Some(ref root) = schema.root {
-            // Use Box::pin for recursive async
-            match Box::pin(self.collect_entries(root, base_path)).await {
-                Ok(entries) => Some(entries),
-                Err(e) => {
-                    self.emit_error(e, Some(base_path)).await;
-                    None
-                }
-            }
-        } else {
-            Some(vec![])
-        }
-    }
-
-    /// Like collect_node_backed_dir_entries but also tracks discovered node-backed dirs.
     async fn collect_node_backed_dir_entries_with_dirs(
         &self,
         node_id: &str,
