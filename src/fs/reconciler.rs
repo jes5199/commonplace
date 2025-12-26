@@ -97,6 +97,7 @@ impl FilesystemReconciler {
     }
 
     /// Internal: perform reconciliation and update node-backed dir watchers.
+    /// On parse errors, falls back to last valid schema to keep reconciling.
     async fn do_reconcile(self: &Arc<Self>) {
         let node = match self.registry.get(&self.fs_root_id).await {
             Some(n) => n,
@@ -120,13 +121,64 @@ impl FilesystemReconciler {
         let discovered_dirs = match self.reconcile_and_collect_dirs(&content).await {
             Ok(dirs) => dirs,
             Err(e) => {
+                // Emit error but fall back to last valid schema
                 self.emit_error(e, None).await;
-                return;
+
+                // Continue reconciling with last valid schema if available
+                match self.reconcile_from_last_valid().await {
+                    Some(dirs) => dirs,
+                    None => return, // No valid schema to fall back to
+                }
             }
         };
 
         // Start watching any new node-backed directories
         self.update_dir_watchers(discovered_dirs).await;
+    }
+
+    /// Reconcile using the last valid schema (for fallback on parse errors).
+    async fn reconcile_from_last_valid(&self) -> Option<HashSet<String>> {
+        let schema_guard = self.last_valid_schema.read().await;
+        let schema = schema_guard.as_ref()?;
+
+        let mut node_backed_dirs = HashSet::new();
+        let mut recursion_stack = HashSet::new();
+
+        let entries = if let Some(ref root) = schema.root {
+            match self
+                .collect_entries_with_dirs(root, "", &mut node_backed_dirs, &mut recursion_stack)
+                .await
+            {
+                Ok(e) => e,
+                Err(_) => return None,
+            }
+        } else {
+            vec![]
+        };
+
+        // Ensure nodes exist
+        let mut known = self.known_nodes.write().await;
+        for (path, node_id, content_type) in entries {
+            let nid = NodeId::new(&node_id);
+            let node_exists = self.registry.get(&nid).await.is_some();
+
+            if !node_exists
+                && self
+                    .registry
+                    .get_or_create_document(&nid, content_type)
+                    .await
+                    .is_ok()
+            {
+                tracing::debug!(
+                    "Recreated fs node from last valid schema: {} -> {}",
+                    path,
+                    node_id
+                );
+            }
+            known.insert(node_id);
+        }
+
+        Some(node_backed_dirs)
     }
 
     /// Reconcile and return the set of node-backed directory IDs discovered.
