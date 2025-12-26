@@ -25,6 +25,13 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use yrs::{Doc, Text, Transact};
 
+/// URL-encode a node ID for use in URL paths.
+/// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
+/// must be percent-encoded to avoid breaking Axum's path parameter routing.
+fn encode_node_id(node_id: &str) -> String {
+    urlencoding::encode(node_id).into_owned()
+}
+
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
 #[derive(Parser, Debug)]
 #[command(name = "commonplace-sync")]
@@ -184,7 +191,7 @@ async fn fork_node(
     source_node: &str,
     at_commit: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut fork_url = format!("{}/nodes/{}/fork", server, source_node);
+    let mut fork_url = format!("{}/nodes/{}/fork", server, encode_node_id(source_node));
     if let Some(commit) = at_commit {
         fork_url = format!("{}?at_commit={}", fork_url, commit);
     }
@@ -290,7 +297,7 @@ async fn run_file_mode(
     );
 
     // Verify node exists
-    let node_url = format!("{}/nodes/{}", server, node_id);
+    let node_url = format!("{}/nodes/{}", server, encode_node_id(&node_id));
     let resp = client.get(&node_url).send().await?;
     if !resp.status().is_success() {
         error!("Node {} not found on server", node_id);
@@ -407,7 +414,7 @@ async fn run_directory_mode(
     }
 
     // Verify fs-root node exists (or create it)
-    let node_url = format!("{}/nodes/{}", server, fs_root_id);
+    let node_url = format!("{}/nodes/{}", server, encode_node_id(&fs_root_id));
     let resp = client.get(&node_url).send().await?;
     if !resp.status().is_success() {
         // Create the node
@@ -431,7 +438,7 @@ async fn run_directory_mode(
     info!("Connected to fs-root node: {}", fs_root_id);
 
     // Check if server has existing schema FIRST (needed for server strategy)
-    let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(&fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
     let server_has_content = if head_resp.status().is_success() {
         let head: HeadResponse = head_resp.json().await?;
@@ -507,7 +514,7 @@ async fn run_directory_mode(
         let state = Arc::new(RwLock::new(SyncState::new()));
 
         // Push initial content if local wins or server is empty
-        let file_head_url = format!("{}/nodes/{}/head", server, node_id);
+        let file_head_url = format!("{}/nodes/{}/head", server, encode_node_id(&node_id));
         let file_head_resp = client.get(&file_head_url).send().await;
 
         let should_push_content = match &file_head_resp {
@@ -822,7 +829,7 @@ async fn push_schema_to_server(
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
-    let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
     let head_resp = client.get(&head_url).send().await?;
 
     if head_resp.status().is_success() {
@@ -850,7 +857,7 @@ async fn push_schema_to_server(
 
     // No existing content, use edit endpoint
     let update = create_yjs_text_update(schema_json);
-    let edit_url = format!("{}/nodes/{}/edit", server, fs_root_id);
+    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -876,7 +883,7 @@ async fn push_file_content(
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check if there's existing content
-    let head_url = format!("{}/nodes/{}/head", server, node_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
     let head_resp = client.get(&head_url).send().await;
 
     match head_resp {
@@ -908,7 +915,7 @@ async fn push_file_content(
 
     // No existing content, use edit endpoint
     let update = create_yjs_text_update(content);
-    let edit_url = format!("{}/nodes/{}/edit", server, node_id);
+    let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(node_id));
     let edit_req = EditRequest {
         update,
         author: Some("sync-client".to_string()),
@@ -1028,7 +1035,7 @@ async fn directory_sse_task(
     directory: PathBuf,
     file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
-    let sse_url = format!("{}/sse/nodes/{}", server, fs_root_id);
+    let sse_url = format!("{}/sse/nodes/{}", server, encode_node_id(&fs_root_id));
 
     loop {
         info!("Connecting to fs-root SSE: {}", sse_url);
@@ -1100,7 +1107,7 @@ async fn handle_schema_change(
     spawn_tasks: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server
-    let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -1153,7 +1160,7 @@ async fn handle_schema_change(
             }
 
             // Fetch content from server
-            let file_head_url = format!("{}/nodes/{}/head", server, node_id);
+            let file_head_url = format!("{}/nodes/{}/head", server, encode_node_id(&node_id));
             if let Ok(resp) = client.get(&file_head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(file_head) = resp.json::<HeadResponse>().await {
@@ -1256,7 +1263,7 @@ async fn initial_sync(
     file_path: &PathBuf,
     state: &Arc<RwLock<SyncState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let head_url = format!("{}/nodes/{}/head", server, node_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
     let resp = client.get(&head_url).send().await?;
 
     if !resp.status().is_success() {
@@ -1470,7 +1477,7 @@ async fn upload_task(
                 // First commit: use edit endpoint with generated Yjs update
                 info!("Creating initial commit...");
                 let update = create_yjs_text_update(&content);
-                let edit_url = format!("{}/nodes/{}/edit", server, node_id);
+                let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(&node_id));
                 let edit_req = EditRequest {
                     update,
                     author: Some("sync-client".to_string()),
@@ -1520,7 +1527,7 @@ async fn sse_task(
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
 ) {
-    let sse_url = format!("{}/sse/nodes/{}", server, node_id);
+    let sse_url = format!("{}/sse/nodes/{}", server, encode_node_id(&node_id));
 
     loop {
         info!("Connecting to SSE: {}", sse_url);
@@ -1629,7 +1636,7 @@ async fn handle_server_edit(
     }
 
     // Safe to overwrite - fetch new content from server
-    let head_url = format!("{}/nodes/{}/head", server, node_id);
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(node_id));
     let resp = match client.get(&head_url).send().await {
         Ok(r) => r,
         Err(e) => {
