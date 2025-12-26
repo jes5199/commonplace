@@ -512,8 +512,9 @@ async fn run_directory_mode(
                     // Push local content (binary files are already base64 encoded)
                     push_file_content(&client, &server, &node_id, &file.content, &state).await?;
                 } else {
-                    // Pull server content to local
+                    // Server has content
                     if initial_sync_strategy == "server" {
+                        // Pull server content to local
                         // For binary files, decode base64; for text, use as-is
                         if file.is_binary {
                             use base64::{engine::general_purpose::STANDARD, Engine};
@@ -523,10 +524,12 @@ async fn run_directory_mode(
                         } else {
                             tokio::fs::write(&file_path, &head.content).await?;
                         }
-                        let mut s = state.write().await;
-                        s.last_written_cid = head.cid;
-                        s.last_written_content = head.content;
                     }
+                    // For all strategies (including "skip"), seed SyncState with server's
+                    // CID/content so SSE updates work and uploads use correct parent CID
+                    let mut s = state.write().await;
+                    s.last_written_cid = head.cid;
+                    s.last_written_content = head.content;
                 }
             } else if should_push_content {
                 // Binary files are already base64 encoded by scan_directory_with_contents
