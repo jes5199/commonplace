@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use yrs::{Doc, Text, Transact};
@@ -342,7 +343,7 @@ async fn run_file_mode(
 }
 
 /// State for a single file in directory sync
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct FileSyncState {
     /// Relative path from directory root
     #[allow(dead_code)]
@@ -351,33 +352,36 @@ struct FileSyncState {
     node_id: String,
     /// Sync state for this file
     state: Arc<RwLock<SyncState>>,
+    /// Task handles for cleanup on deletion
+    task_handles: Vec<JoinHandle<()>>,
 }
 
-/// Spawn sync tasks (watcher, upload, SSE) for a single file
+/// Spawn sync tasks (watcher, upload, SSE) for a single file.
+/// Returns the task handles so they can be aborted on file deletion.
 fn spawn_file_sync_tasks(
     client: Client,
     server: String,
     node_id: String,
     file_path: PathBuf,
     state: Arc<RwLock<SyncState>>,
-) {
+) -> Vec<JoinHandle<()>> {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
-    // File watcher task
-    tokio::spawn(file_watcher_task(file_path.clone(), file_tx));
-
-    // Upload task
-    tokio::spawn(upload_task(
-        client.clone(),
-        server.clone(),
-        node_id.clone(),
-        file_path.clone(),
-        state.clone(),
-        file_rx,
-    ));
-
-    // SSE task
-    tokio::spawn(sse_task(client, server, node_id, file_path, state));
+    vec![
+        // File watcher task
+        tokio::spawn(file_watcher_task(file_path.clone(), file_tx)),
+        // Upload task
+        tokio::spawn(upload_task(
+            client.clone(),
+            server.clone(),
+            node_id.clone(),
+            file_path.clone(),
+            state.clone(),
+            file_rx,
+        )),
+        // SSE task
+        tokio::spawn(sse_task(client, server, node_id, file_path, state)),
+    ]
 }
 
 /// Run directory sync mode
@@ -555,7 +559,7 @@ async fn run_directory_mode(
             }
         }
 
-        // Store state for this file
+        // Store state for this file (tasks will be spawned after initial sync)
         {
             let mut states = file_states.write().await;
             states.insert(
@@ -564,6 +568,7 @@ async fn run_directory_mode(
                     relative_path: file.relative_path.clone(),
                     node_id: node_id.clone(),
                     state,
+                    task_handles: Vec::new(), // Will be populated after initial sync
                 },
             );
         }
@@ -588,40 +593,20 @@ async fn run_directory_mode(
         file_states.clone(),
     ));
 
-    // Start file sync tasks for each file
-    let mut file_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
+    // Start file sync tasks for each file and store handles in FileSyncState
     {
-        let states = file_states.read().await;
-        for (relative_path, file_state) in states.iter() {
+        let mut states = file_states.write().await;
+        for (relative_path, file_state) in states.iter_mut() {
             let file_path = directory.join(relative_path);
-            let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
 
-            // File watcher for individual file
-            let file_watcher_handle = tokio::spawn(file_watcher_task(file_path.clone(), file_tx));
-
-            // Upload task for this file
-            let upload_handle = tokio::spawn(upload_task(
+            // Spawn sync tasks and store handles in FileSyncState for cleanup on deletion
+            file_state.task_handles = spawn_file_sync_tasks(
                 client.clone(),
                 server.clone(),
                 file_state.node_id.clone(),
-                file_path.clone(),
+                file_path,
                 file_state.state.clone(),
-                file_rx,
-            ));
-
-            // SSE task for this file
-            let file_sse_handle = tokio::spawn(sse_task(
-                client.clone(),
-                server.clone(),
-                file_state.node_id.clone(),
-                file_path.clone(),
-                file_state.state.clone(),
-            ));
-
-            file_handles.push(file_watcher_handle);
-            file_handles.push(upload_handle);
-            file_handles.push(file_sse_handle);
+            );
         }
     }
 
@@ -725,27 +710,28 @@ async fn run_directory_mode(
                                 }
                             }
 
-                            // Add to file_states
+                            // Spawn sync tasks for the new file
+                            let task_handles = spawn_file_sync_tasks(
+                                client.clone(),
+                                server.clone(),
+                                node_id.clone(),
+                                path.clone(),
+                                state.clone(),
+                            );
+
+                            // Add to file_states with task handles
                             {
                                 let mut states = file_states.write().await;
                                 states.insert(
                                     relative_path.clone(),
                                     FileSyncState {
                                         relative_path: relative_path.clone(),
-                                        node_id: node_id.clone(),
-                                        state: state.clone(),
+                                        node_id,
+                                        state,
+                                        task_handles,
                                     },
                                 );
                             }
-
-                            // Spawn sync tasks for the new file
-                            spawn_file_sync_tasks(
-                                client.clone(),
-                                server.clone(),
-                                node_id,
-                                path.clone(),
-                                state,
-                            );
 
                             info!("Started sync for new local file: {}", relative_path);
                         }
@@ -767,6 +753,27 @@ async fn run_directory_mode(
                     }
                     DirEvent::Deleted(path) => {
                         debug!("Directory event: file deleted: {}", path.display());
+
+                        // Calculate relative path
+                        let relative_path = match path.strip_prefix(&directory) {
+                            Ok(rel) => rel.to_string_lossy().to_string(),
+                            Err(_) => {
+                                warn!("Could not strip prefix from deleted path");
+                                continue;
+                            }
+                        };
+
+                        // Stop sync tasks for this file and remove from file_states
+                        {
+                            let mut states = file_states.write().await;
+                            if let Some(file_state) = states.remove(&relative_path) {
+                                info!("Stopping sync tasks for deleted file: {}", relative_path);
+                                for handle in file_state.task_handles {
+                                    handle.abort();
+                                }
+                            }
+                        }
+
                         // Rescan and push updated schema
                         if let Ok(schema) = scan_directory(&directory, &options) {
                             if let Ok(json) = schema_to_json(&schema) {
@@ -792,8 +799,15 @@ async fn run_directory_mode(
     watcher_handle.abort();
     sse_handle.abort();
     dir_event_handle.abort();
-    for handle in file_handles {
-        handle.abort();
+
+    // Abort all per-file sync tasks
+    {
+        let states = file_states.read().await;
+        for file_state in states.values() {
+            for handle in &file_state.task_handles {
+                handle.abort();
+            }
+        }
     }
 
     info!("Goodbye!");
@@ -1165,10 +1179,20 @@ async fn handle_schema_change(
                             last_written_content: file_head.content,
                         }));
 
-                        // Clone for spawn_file_sync_tasks before moving into FileSyncState
-                        let sync_node_id = node_id.clone();
-                        let sync_state = state.clone();
-                        let sync_file_path = file_path.clone();
+                        info!("Created local file: {}", file_path.display());
+
+                        // Spawn sync tasks for the new file (only if requested)
+                        let task_handles = if spawn_tasks {
+                            spawn_file_sync_tasks(
+                                client.clone(),
+                                server.to_string(),
+                                node_id.clone(),
+                                file_path.clone(),
+                                state.clone(),
+                            )
+                        } else {
+                            Vec::new()
+                        };
 
                         let mut states = file_states.write().await;
                         states.insert(
@@ -1177,21 +1201,9 @@ async fn handle_schema_change(
                                 relative_path: path.clone(),
                                 node_id,
                                 state,
+                                task_handles,
                             },
                         );
-
-                        info!("Created local file: {}", file_path.display());
-
-                        // Spawn sync tasks for the new file (only if requested)
-                        if spawn_tasks {
-                            spawn_file_sync_tasks(
-                                client.clone(),
-                                server.to_string(),
-                                sync_node_id,
-                                sync_file_path,
-                                sync_state,
-                            );
-                        }
                     }
                 }
             }
