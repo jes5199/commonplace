@@ -635,8 +635,19 @@ async fn run_directory_mode(
                             let node_id = format!("{}:{}", fs_root_id, relative_path);
                             let state = Arc::new(RwLock::new(SyncState::new()));
 
-                            // Read and push initial content
-                            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                            // Read and push initial content (handle binary files)
+                            if let Ok(raw_content) = tokio::fs::read(&path).await {
+                                let content_info = detect_from_path(&path);
+                                let is_binary =
+                                    content_info.is_binary || is_binary_content(&raw_content);
+
+                                let content = if is_binary {
+                                    use base64::{engine::general_purpose::STANDARD, Engine};
+                                    STANDARD.encode(&raw_content)
+                                } else {
+                                    String::from_utf8_lossy(&raw_content).to_string()
+                                };
+
                                 if let Err(e) =
                                     push_file_content(&client, &server, &node_id, &content, &state)
                                         .await
@@ -1072,8 +1083,21 @@ async fn handle_schema_change(
             if let Ok(resp) = client.get(&file_head_url).send().await {
                 if resp.status().is_success() {
                     if let Ok(file_head) = resp.json::<HeadResponse>().await {
-                        // Write to local file
-                        tokio::fs::write(&file_path, &file_head.content).await?;
+                        // Detect if file is binary and decode base64 if needed
+                        let content_info = detect_from_path(&file_path);
+                        let write_result = if content_info.is_binary {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            match STANDARD.decode(&file_head.content) {
+                                Ok(decoded) => tokio::fs::write(&file_path, &decoded).await,
+                                Err(e) => {
+                                    warn!("Failed to decode binary content: {}", e);
+                                    tokio::fs::write(&file_path, &file_head.content).await
+                                }
+                            }
+                        } else {
+                            tokio::fs::write(&file_path, &file_head.content).await
+                        };
+                        write_result?;
 
                         // Add to file states
                         let state = Arc::new(RwLock::new(SyncState {
