@@ -8,6 +8,14 @@ use std::io;
 use std::path::Path;
 use thiserror::Error;
 
+/// Normalize a path to use forward slashes regardless of OS.
+///
+/// Schema paths always use forward slashes, so relative paths must be
+/// normalized for consistency across platforms.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Error type for directory scanning operations.
 #[derive(Debug, Error)]
 pub enum ScanError {
@@ -193,9 +201,10 @@ fn scan_files_recursive(
         if file_type.is_dir() {
             scan_files_recursive(root, &entry_path, options, files)?;
         } else if file_type.is_file() {
+            // Normalize to forward slashes for cross-platform consistency
             let relative = entry_path
                 .strip_prefix(root)
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| normalize_path(&p.to_string_lossy()))
                 .unwrap_or_else(|_| name.clone());
 
             let content_info = detect_from_path(&entry_path);
