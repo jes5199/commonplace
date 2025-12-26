@@ -341,15 +341,42 @@ async fn run_file_mode(
 }
 
 /// State for a single file in directory sync
-#[derive(Debug)]
-#[allow(dead_code)] // Will be used in Phase 5 (server → local sync)
+#[derive(Debug, Clone)]
 struct FileSyncState {
     /// Relative path from directory root
+    #[allow(dead_code)]
     relative_path: String,
     /// Derived node ID
     node_id: String,
     /// Sync state for this file
     state: Arc<RwLock<SyncState>>,
+}
+
+/// Spawn sync tasks (watcher, upload, SSE) for a single file
+fn spawn_file_sync_tasks(
+    client: Client,
+    server: String,
+    node_id: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+) {
+    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+
+    // File watcher task
+    tokio::spawn(file_watcher_task(file_path.clone(), file_tx));
+
+    // Upload task
+    tokio::spawn(upload_task(
+        client.clone(),
+        server.clone(),
+        node_id.clone(),
+        file_path.clone(),
+        state.clone(),
+        file_rx,
+    ));
+
+    // SSE task
+    tokio::spawn(sse_task(client, server, node_id, file_path, state));
 }
 
 /// Run directory sync mode
@@ -398,16 +425,7 @@ async fn run_directory_mode(
     }
     info!("Connected to fs-root node: {}", fs_root_id);
 
-    // Scan directory and generate FS schema
-    info!("Scanning directory...");
-    let schema = scan_directory(&directory, &options).map_err(|e| format!("Scan error: {}", e))?;
-    let schema_json = schema_to_json(&schema)?;
-    info!(
-        "Directory scanned: generated {} bytes of schema JSON",
-        schema_json.len()
-    );
-
-    // Check if server has existing schema
+    // Check if server has existing schema FIRST (needed for server strategy)
     let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
     let head_resp = client.get(&head_url).send().await?;
     let server_has_content = if head_resp.status().is_success() {
@@ -416,6 +434,26 @@ async fn run_directory_mode(
     } else {
         false
     };
+
+    // If strategy is "server" and server has content, pull server files first
+    // This creates the temporary file_states that handle_schema_change needs
+    let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    if initial_sync_strategy == "server" && server_has_content {
+        info!("Pulling server schema first (initial-sync=server)...");
+        handle_schema_change(&client, &server, &fs_root_id, &directory, &file_states).await?;
+        info!("Server files pulled to local directory");
+    }
+
+    // Scan directory and generate FS schema
+    info!("Scanning directory...");
+    let schema = scan_directory(&directory, &options).map_err(|e| format!("Scan error: {}", e))?;
+    let schema_json = schema_to_json(&schema)?;
+    info!(
+        "Directory scanned: generated {} bytes of schema JSON",
+        schema_json.len()
+    );
 
     // Decide whether to push local schema based on strategy
     let should_push_schema = match initial_sync_strategy.as_str() {
@@ -442,11 +480,7 @@ async fn run_directory_mode(
     let files = scan_directory_with_contents(&directory, &options)
         .map_err(|e| format!("Scan error: {}", e))?;
 
-    // Create state map for all files
-    let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-
-    // Sync each file
+    // Sync each file (file_states was created earlier for server-first pull)
     for file in &files {
         let node_id = format!("{}:{}", fs_root_id, file.relative_path);
         info!("Syncing file: {} -> {}", file.relative_path, node_id);
@@ -474,21 +508,27 @@ async fn run_directory_mode(
             if resp.status().is_success() {
                 let head: HeadResponse = resp.json().await?;
                 if head.content.is_empty() || initial_sync_strategy == "local" {
-                    // Push local content
-                    if !file.is_binary {
-                        push_file_content(&client, &server, &node_id, &file.content, &state)
-                            .await?;
-                    }
+                    // Push local content (binary files are already base64 encoded)
+                    push_file_content(&client, &server, &node_id, &file.content, &state).await?;
                 } else {
                     // Pull server content to local
-                    if initial_sync_strategy == "server" && !file.is_binary {
-                        tokio::fs::write(&file_path, &head.content).await?;
+                    if initial_sync_strategy == "server" {
+                        // For binary files, decode base64; for text, use as-is
+                        if file.is_binary {
+                            use base64::{engine::general_purpose::STANDARD, Engine};
+                            if let Ok(decoded) = STANDARD.decode(&head.content) {
+                                tokio::fs::write(&file_path, &decoded).await?;
+                            }
+                        } else {
+                            tokio::fs::write(&file_path, &head.content).await?;
+                        }
                         let mut s = state.write().await;
                         s.last_written_cid = head.cid;
                         s.last_written_content = head.content;
                     }
                 }
-            } else if should_push_content && !file.is_binary {
+            } else if should_push_content {
+                // Binary files are already base64 encoded by scan_directory_with_contents
                 push_file_content(&client, &server, &node_id, &file.content, &state).await?;
             }
         }
@@ -570,12 +610,81 @@ async fn run_directory_mode(
         let fs_root_id = fs_root_id.clone();
         let directory = directory.clone();
         let options = options.clone();
+        let file_states = file_states.clone();
         async move {
             while let Some(event) = dir_rx.recv().await {
                 match event {
-                    DirEvent::Created(path) | DirEvent::Modified(path) => {
-                        debug!("Directory event: file created/modified: {}", path.display());
+                    DirEvent::Created(path) => {
+                        debug!("Directory event: file created: {}", path.display());
+
+                        // Calculate relative path
+                        let relative_path = match path.strip_prefix(&directory) {
+                            Ok(rel) => rel.to_string_lossy().to_string(),
+                            Err(_) => continue,
+                        };
+
+                        // Check if we already have sync tasks for this file
+                        let already_tracked = {
+                            let states = file_states.read().await;
+                            states.contains_key(&relative_path)
+                        };
+
+                        if !already_tracked && path.is_file() {
+                            // New file - add to state and spawn sync tasks
+                            let node_id = format!("{}:{}", fs_root_id, relative_path);
+                            let state = Arc::new(RwLock::new(SyncState::new()));
+
+                            // Read and push initial content
+                            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                                if let Err(e) =
+                                    push_file_content(&client, &server, &node_id, &content, &state)
+                                        .await
+                                {
+                                    warn!("Failed to push new file content: {}", e);
+                                }
+                            }
+
+                            // Add to file_states
+                            {
+                                let mut states = file_states.write().await;
+                                states.insert(
+                                    relative_path.clone(),
+                                    FileSyncState {
+                                        relative_path: relative_path.clone(),
+                                        node_id: node_id.clone(),
+                                        state: state.clone(),
+                                    },
+                                );
+                            }
+
+                            // Spawn sync tasks for the new file
+                            spawn_file_sync_tasks(
+                                client.clone(),
+                                server.clone(),
+                                node_id,
+                                path.clone(),
+                                state,
+                            );
+
+                            info!("Started sync for new local file: {}", relative_path);
+                        }
+
                         // Rescan and push updated schema
+                        if let Ok(schema) = scan_directory(&directory, &options) {
+                            if let Ok(json) = schema_to_json(&schema) {
+                                if let Err(e) =
+                                    push_schema_to_server(&client, &server, &fs_root_id, &json)
+                                        .await
+                                {
+                                    warn!("Failed to push updated schema: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    DirEvent::Modified(path) => {
+                        debug!("Directory event: file modified: {}", path.display());
+                        // Modified files are handled by per-file watchers
+                        // Just update schema in case metadata changed
                         if let Ok(schema) = scan_directory(&directory, &options) {
                             if let Ok(json) = schema_to_json(&schema) {
                                 if let Err(e) =
@@ -967,9 +1076,14 @@ async fn handle_schema_change(
 
                         // Add to file states
                         let state = Arc::new(RwLock::new(SyncState {
-                            last_written_cid: file_head.cid,
+                            last_written_cid: file_head.cid.clone(),
                             last_written_content: file_head.content,
                         }));
+
+                        // Clone for spawn_file_sync_tasks before moving into FileSyncState
+                        let sync_node_id = node_id.clone();
+                        let sync_state = state.clone();
+                        let sync_file_path = file_path.clone();
 
                         let mut states = file_states.write().await;
                         states.insert(
@@ -982,6 +1096,15 @@ async fn handle_schema_change(
                         );
 
                         info!("Created local file: {}", file_path.display());
+
+                        // Spawn sync tasks for the new file
+                        spawn_file_sync_tasks(
+                            client.clone(),
+                            server.to_string(),
+                            sync_node_id,
+                            sync_file_path,
+                            sync_state,
+                        );
                     }
                 }
             }
