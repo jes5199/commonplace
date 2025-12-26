@@ -142,8 +142,9 @@ impl FilesystemReconciler {
 
         // 3. Collect all entries and node-backed dirs from schema
         let mut node_backed_dirs = HashSet::new();
+        let mut recursion_stack = HashSet::new(); // Track current recursion path for cycle detection
         let entries = if let Some(ref root) = schema.root {
-            self.collect_entries_with_dirs(root, "", &mut node_backed_dirs)
+            self.collect_entries_with_dirs(root, "", &mut node_backed_dirs, &mut recursion_stack)
                 .await?
         } else {
             vec![]
@@ -186,6 +187,7 @@ impl FilesystemReconciler {
 
                 let reconciler = self.clone();
                 let node_id = NodeId::new(&dir_id);
+                let dir_id_clone = dir_id.clone();
 
                 tokio::spawn(async move {
                     if let Some(node) = reconciler.registry.get(&node_id).await {
@@ -211,6 +213,9 @@ impl FilesystemReconciler {
                                         "node-backed dir {} closed, stopping watcher",
                                         node_id.0
                                     );
+                                    // Remove from watched_dirs so watcher can be re-armed
+                                    // if the node is recreated
+                                    reconciler.watched_dirs.write().await.remove(&dir_id_clone);
                                     break;
                                 }
                             }
@@ -354,11 +359,14 @@ impl FilesystemReconciler {
     }
 
     /// Walk the entry tree, collecting entries and tracking node-backed directory IDs.
+    /// Uses recursion_stack to detect cycles (same node in current path), while
+    /// node_backed_dirs collects all unique node-backed dirs for watcher registration.
     async fn collect_entries_with_dirs(
         &self,
         entry: &Entry,
         current_path: &str,
         node_backed_dirs: &mut HashSet<String>,
+        recursion_stack: &mut HashSet<String>,
     ) -> Result<Vec<(String, String, ContentType)>, FsError> {
         let mut results = vec![];
 
@@ -399,27 +407,35 @@ impl FilesystemReconciler {
                     // First, ensure the node exists
                     results.push((current_path.to_string(), nid.clone(), content_type.clone()));
 
-                    // Check for cycles before recursing - skip if we've seen this node
-                    if node_backed_dirs.contains(nid) {
+                    // Track this as a node-backed directory (for watcher registration)
+                    node_backed_dirs.insert(nid.clone());
+
+                    // Check for cycles - only skip if this node is in current recursion path
+                    // (same node at different paths is allowed - multi-mount)
+                    if recursion_stack.contains(nid) {
                         tracing::warn!(
-                            "Cycle detected: node-backed dir {} already visited, skipping",
+                            "Cycle detected: node-backed dir {} in current path, skipping",
                             nid
                         );
                     } else {
-                        // Track this as a node-backed directory
-                        node_backed_dirs.insert(nid.clone());
+                        // Add to recursion stack before descending
+                        recursion_stack.insert(nid.clone());
 
-                        // Then, try to recursively process its content
+                        // Try to recursively process its content
                         if let Some(child_entries) = self
                             .collect_node_backed_dir_entries_with_dirs(
                                 nid,
                                 current_path,
                                 node_backed_dirs,
+                                recursion_stack,
                             )
                             .await
                         {
                             results.extend(child_entries);
                         }
+
+                        // Remove from recursion stack after returning
+                        recursion_stack.remove(nid);
                     }
                 }
 
@@ -439,6 +455,7 @@ impl FilesystemReconciler {
                                 child,
                                 &child_path,
                                 node_backed_dirs,
+                                recursion_stack,
                             ))
                             .await?,
                         );
@@ -513,6 +530,7 @@ impl FilesystemReconciler {
         node_id: &str,
         base_path: &str,
         node_backed_dirs: &mut HashSet<String>,
+        recursion_stack: &mut HashSet<String>,
     ) -> Option<Vec<(String, String, ContentType)>> {
         let nid = NodeId::new(node_id);
 
@@ -550,7 +568,13 @@ impl FilesystemReconciler {
 
         // Recursively collect from the nested root
         if let Some(ref root) = schema.root {
-            match Box::pin(self.collect_entries_with_dirs(root, base_path, node_backed_dirs)).await
+            match Box::pin(self.collect_entries_with_dirs(
+                root,
+                base_path,
+                node_backed_dirs,
+                recursion_stack,
+            ))
+            .await
             {
                 Ok(entries) => Some(entries),
                 Err(e) => {
