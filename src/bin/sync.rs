@@ -7,7 +7,8 @@
 use clap::Parser;
 use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::{
-    scan_directory, scan_directory_with_contents, schema_to_json, ScanOptions,
+    detect_from_path, is_binary_content, scan_directory, scan_directory_with_contents,
+    schema_to_json, ScanOptions,
 };
 use futures::StreamExt;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -1250,13 +1251,24 @@ async fn upload_task(
     mut rx: mpsc::Receiver<FileEvent>,
 ) {
     while let Some(_event) = rx.recv().await {
-        // Read current file content
-        let content = match tokio::fs::read_to_string(&file_path).await {
+        // Read current file content as bytes
+        let raw_content = match tokio::fs::read(&file_path).await {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to read file: {}", e);
                 continue;
             }
+        };
+
+        // Detect if file is binary and convert accordingly
+        let content_info = detect_from_path(&file_path);
+        let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+
+        let content = if is_binary {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.encode(&raw_content)
+        } else {
+            String::from_utf8_lossy(&raw_content).to_string()
         };
 
         // Check if this is an echo from our own write
@@ -1449,13 +1461,25 @@ async fn handle_server_edit(
     state: &Arc<RwLock<SyncState>>,
     _edit: &EditEventData,
 ) {
-    // Read current local file content
-    let local_content = match tokio::fs::read_to_string(file_path).await {
+    // Detect if this file is binary
+    let content_info = detect_from_path(file_path);
+    let is_binary_file = content_info.is_binary;
+
+    // Read current local file content as bytes
+    let raw_content = match tokio::fs::read(file_path).await {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to read local file: {}", e);
             return;
         }
+    };
+
+    // Convert to string (base64 for binary, UTF-8 for text)
+    let local_content = if is_binary_file || is_binary_content(&raw_content) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        STANDARD.encode(&raw_content)
+    } else {
+        String::from_utf8_lossy(&raw_content).to_string()
     };
 
     // Check if there are pending local changes
@@ -1503,8 +1527,22 @@ async fn handle_server_edit(
     }
 
     // Write to local file (atomic via temp file)
+    // For binary files, decode base64 before writing
     let temp_path = file_path.with_extension("tmp");
-    if let Err(e) = tokio::fs::write(&temp_path, &head.content).await {
+    let write_result = if is_binary_file {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => tokio::fs::write(&temp_path, &decoded).await,
+            Err(e) => {
+                error!("Failed to decode base64 content: {}", e);
+                return;
+            }
+        }
+    } else {
+        tokio::fs::write(&temp_path, &head.content).await
+    };
+
+    if let Err(e) = write_result {
         error!("Failed to write temp file: {}", e);
         // Note: state is already updated, which is fine - next server event
         // will retry and the echo detection will still work correctly
