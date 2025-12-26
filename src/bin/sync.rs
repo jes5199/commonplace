@@ -5,6 +5,7 @@
 //! server changes update local files.
 
 use clap::Parser;
+use commonplace_doc::fs::{Entry, FsSchema};
 use commonplace_doc::sync::{
     scan_directory, scan_directory_with_contents, schema_to_json, ScanOptions,
 };
@@ -829,16 +830,185 @@ async fn directory_watcher_task(
 
 /// SSE task for directory-level events (watching fs-root)
 async fn directory_sse_task(
-    _client: Client,
-    _server: String,
-    _fs_root_id: String,
-    _directory: PathBuf,
-    _file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    client: Client,
+    server: String,
+    fs_root_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
 ) {
-    // TODO: Implement Phase 5 - server → local sync
-    // For now, just keep the task alive
+    let sse_url = format!("{}/sse/nodes/{}", server, fs_root_id);
+
     loop {
-        sleep(Duration::from_secs(60)).await;
+        info!("Connecting to fs-root SSE: {}", sse_url);
+
+        let request_builder = client.get(&sse_url);
+        let mut es = match EventSource::new(request_builder) {
+            Ok(es) => es,
+            Err(e) => {
+                error!("Failed to create fs-root EventSource: {}", e);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(SseEvent::Open) => {
+                    info!("fs-root SSE connection opened");
+                }
+                Ok(SseEvent::Message(msg)) => {
+                    debug!("fs-root SSE event: {} - {}", msg.event, msg.data);
+
+                    match msg.event.as_str() {
+                        "connected" => {
+                            info!("fs-root SSE connected");
+                        }
+                        "edit" => {
+                            // Schema changed on server, sync new files to local
+                            if let Err(e) = handle_schema_change(
+                                &client,
+                                &server,
+                                &fs_root_id,
+                                &directory,
+                                &file_states,
+                            )
+                            .await
+                            {
+                                warn!("Failed to handle schema change: {}", e);
+                            }
+                        }
+                        "closed" => {
+                            warn!("fs-root SSE: Target node shut down");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    error!("fs-root SSE error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        warn!("fs-root SSE connection closed, reconnecting in 5s...");
+        sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Handle a schema change from the server - create new local files
+async fn handle_schema_change(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &std::path::Path,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch current schema from server
+    let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch fs-root HEAD: {}", resp.status()).into());
+    }
+
+    let head: HeadResponse = resp.json().await?;
+    if head.content.is_empty() {
+        return Ok(());
+    }
+
+    // Parse schema
+    let schema: FsSchema = match serde_json::from_str(&head.content) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to parse fs-root schema: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Collect all paths from schema
+    let mut schema_paths: Vec<String> = Vec::new();
+    if let Some(ref root) = schema.root {
+        collect_paths_from_entry(root, "", &mut schema_paths);
+    }
+
+    // Check for new paths not in our state
+    let known_paths: Vec<String> = {
+        let states = file_states.read().await;
+        states.keys().cloned().collect()
+    };
+
+    for path in &schema_paths {
+        if !known_paths.contains(path) {
+            // New file from server - create local file and fetch content
+            let node_id = format!("{}:{}", fs_root_id, path);
+            let file_path = directory.join(path);
+
+            info!(
+                "Server created new file: {} -> {}",
+                path,
+                file_path.display()
+            );
+
+            // Create parent directories if needed
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+
+            // Fetch content from server
+            let file_head_url = format!("{}/nodes/{}/head", server, node_id);
+            if let Ok(resp) = client.get(&file_head_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(file_head) = resp.json::<HeadResponse>().await {
+                        // Write to local file
+                        tokio::fs::write(&file_path, &file_head.content).await?;
+
+                        // Add to file states
+                        let state = Arc::new(RwLock::new(SyncState {
+                            last_written_cid: file_head.cid,
+                            last_written_content: file_head.content,
+                        }));
+
+                        let mut states = file_states.write().await;
+                        states.insert(
+                            path.clone(),
+                            FileSyncState {
+                                relative_path: path.clone(),
+                                node_id,
+                                state,
+                            },
+                        );
+
+                        info!("Created local file: {}", file_path.display());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively collect file paths from an entry
+fn collect_paths_from_entry(entry: &Entry, prefix: &str, paths: &mut Vec<String>) {
+    match entry {
+        Entry::Dir(dir) => {
+            if let Some(ref entries) = dir.entries {
+                for (name, child) in entries {
+                    let child_path = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    collect_paths_from_entry(child, &child_path, paths);
+                }
+            }
+        }
+        Entry::Doc(_) => {
+            paths.push(prefix.to_string());
+        }
     }
 }
 
