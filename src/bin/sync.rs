@@ -32,6 +32,15 @@ fn encode_node_id(node_id: &str) -> String {
     urlencoding::encode(node_id).into_owned()
 }
 
+/// Normalize a path to use forward slashes regardless of OS.
+///
+/// Schema paths always use forward slashes, but on Windows `to_string_lossy()`
+/// produces backslashes. This normalizes to forward slashes so node IDs match
+/// between the client and server.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Commonplace Sync - Keep a local file or directory in sync with a server document
 #[derive(Parser, Debug)]
 #[command(name = "commonplace-sync")]
@@ -631,9 +640,9 @@ async fn run_directory_mode(
                     DirEvent::Created(path) => {
                         debug!("Directory event: file created: {}", path.display());
 
-                        // Calculate relative path
+                        // Calculate relative path (normalized to forward slashes for cross-platform consistency)
                         let relative_path = match path.strip_prefix(&directory) {
-                            Ok(rel) => rel.to_string_lossy().to_string(),
+                            Ok(rel) => normalize_path(&rel.to_string_lossy()),
                             Err(_) => continue,
                         };
 
@@ -761,9 +770,9 @@ async fn run_directory_mode(
                     DirEvent::Deleted(path) => {
                         debug!("Directory event: file deleted: {}", path.display());
 
-                        // Calculate relative path
+                        // Calculate relative path (normalized to forward slashes for cross-platform consistency)
                         let relative_path = match path.strip_prefix(&directory) {
-                            Ok(rel) => rel.to_string_lossy().to_string(),
+                            Ok(rel) => normalize_path(&rel.to_string_lossy()),
                             Err(_) => {
                                 warn!("Could not strip prefix from deleted path");
                                 continue;
