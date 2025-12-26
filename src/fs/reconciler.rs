@@ -212,6 +212,7 @@ impl FilesystemReconciler {
 
     /// Try to fetch and parse a node-backed directory's content.
     /// Returns None if the node doesn't exist yet or content is invalid.
+    /// Emits fs.error events for parse/schema errors so clients can debug.
     async fn collect_node_backed_dir_entries(
         &self,
         node_id: &str,
@@ -219,25 +220,48 @@ impl FilesystemReconciler {
     ) -> Option<Vec<(String, String, ContentType)>> {
         let nid = NodeId::new(node_id);
 
-        // Try to get existing node
+        // Try to get existing node - not an error if it doesn't exist yet
         let node = self.registry.get(&nid).await?;
 
-        // Try to get content
+        // Try to get content - not an error if node isn't a document
         let doc_node = node.as_any().downcast_ref::<DocumentNode>()?;
-        let content = doc_node.get_content().await.ok()?;
+        let content = match doc_node.get_content().await {
+            Ok(c) => c,
+            Err(_) => return None, // Content retrieval failure is not a schema error
+        };
 
-        // Try to parse as filesystem schema
-        let schema: FsSchema = serde_json::from_str(&content).ok()?;
+        // Empty content is not an error (node just hasn't been populated)
+        if content.is_empty() || content == "{}" {
+            return None;
+        }
 
-        // Validate version (same as main reconcile)
+        // Try to parse as filesystem schema - emit error if invalid
+        let schema: FsSchema = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                self.emit_error(FsError::ParseError(e.to_string()), Some(base_path))
+                    .await;
+                return None;
+            }
+        };
+
+        // Validate version - emit error if unsupported
         if schema.version != 1 {
+            self.emit_error(FsError::UnsupportedVersion(schema.version), Some(base_path))
+                .await;
             return None;
         }
 
         // Recursively collect from the nested root
         if let Some(ref root) = schema.root {
             // Use Box::pin for recursive async
-            Box::pin(self.collect_entries(root, base_path)).await.ok()
+            match Box::pin(self.collect_entries(root, base_path)).await {
+                Ok(entries) => Some(entries),
+                Err(e) => {
+                    self.emit_error(e, Some(base_path)).await;
+                    None
+                }
+            }
         } else {
             Some(vec![])
         }
