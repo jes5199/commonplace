@@ -177,54 +177,53 @@ impl FilesystemReconciler {
     }
 
     /// Update watchers for node-backed directories.
+    /// Always (re)starts watchers for discovered dirs to handle node recreation.
     async fn update_dir_watchers(self: &Arc<Self>, discovered: HashSet<String>) {
+        // Clear watched_dirs and restart all watchers on each reconcile.
+        // This handles the case where a node was deleted and recreated -
+        // old watchers may be subscribed to stale node instances.
         let mut watched = self.watched_dirs.write().await;
+        watched.clear();
 
         for dir_id in discovered {
-            if !watched.contains(&dir_id) {
-                // New node-backed directory - start watching it
-                watched.insert(dir_id.clone());
+            watched.insert(dir_id.clone());
 
-                let reconciler = self.clone();
-                let node_id = NodeId::new(&dir_id);
-                let dir_id_clone = dir_id.clone();
+            let reconciler = self.clone();
+            let node_id = NodeId::new(&dir_id);
+            let dir_id_clone = dir_id.clone();
 
-                tokio::spawn(async move {
-                    if let Some(node) = reconciler.registry.get(&node_id).await {
-                        let mut sub = node.subscribe_blue();
-                        loop {
-                            match sub.recv().await {
-                                Ok(_) => {
-                                    // Trigger reconciliation via channel
-                                    if let Some(ref tx) = *reconciler.reconcile_trigger.read().await
-                                    {
-                                        let _ = tx.send(()).await;
-                                    }
+            tokio::spawn(async move {
+                if let Some(node) = reconciler.registry.get(&node_id).await {
+                    let mut sub = node.subscribe_blue();
+                    loop {
+                        match sub.recv().await {
+                            Ok(_) => {
+                                // Trigger reconciliation via channel
+                                if let Some(ref tx) = *reconciler.reconcile_trigger.read().await {
+                                    let _ = tx.send(()).await;
                                 }
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!(
-                                        "node-backed dir {} watcher lagged by {} messages",
-                                        node_id.0,
-                                        n
-                                    );
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    tracing::debug!(
-                                        "node-backed dir {} closed, stopping watcher",
-                                        node_id.0
-                                    );
-                                    // Remove from watched_dirs so watcher can be re-armed
-                                    // if the node is recreated
-                                    reconciler.watched_dirs.write().await.remove(&dir_id_clone);
-                                    break;
-                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    "node-backed dir {} watcher lagged by {} messages",
+                                    node_id.0,
+                                    n
+                                );
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                tracing::debug!(
+                                    "node-backed dir {} closed, stopping watcher",
+                                    node_id.0
+                                );
+                                reconciler.watched_dirs.write().await.remove(&dir_id_clone);
+                                break;
                             }
                         }
                     }
-                });
+                }
+            });
 
-                tracing::debug!("Started watching node-backed dir: {}", dir_id);
-            }
+            tracing::debug!("Started watching node-backed dir: {}", dir_id);
         }
     }
 
