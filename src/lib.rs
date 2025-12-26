@@ -10,6 +10,7 @@ pub mod node;
 pub mod replay;
 pub mod sse;
 pub mod store;
+pub mod sync;
 
 use axum::{routing::get, Router};
 use document::{ContentType, DocumentStore};
