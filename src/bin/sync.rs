@@ -443,7 +443,16 @@ async fn run_directory_mode(
 
     if initial_sync_strategy == "server" && server_has_content {
         info!("Pulling server schema first (initial-sync=server)...");
-        handle_schema_change(&client, &server, &fs_root_id, &directory, &file_states).await?;
+        // Don't spawn tasks here - the main loop will spawn them for all files
+        handle_schema_change(
+            &client,
+            &server,
+            &fs_root_id,
+            &directory,
+            &file_states,
+            false,
+        )
+        .await?;
         info!("Server files pulled to local directory");
     }
 
@@ -989,12 +998,14 @@ async fn directory_sse_task(
                         }
                         "edit" => {
                             // Schema changed on server, sync new files to local
+                            // Spawn tasks for new files discovered during runtime
                             if let Err(e) = handle_schema_change(
                                 &client,
                                 &server,
                                 &fs_root_id,
                                 &directory,
                                 &file_states,
+                                true, // spawn_tasks: true for runtime schema changes
                             )
                             .await
                             {
@@ -1027,6 +1038,7 @@ async fn handle_schema_change(
     fs_root_id: &str,
     directory: &std::path::Path,
     file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    spawn_tasks: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch current schema from server
     let head_url = format!("{}/nodes/{}/head", server, fs_root_id);
@@ -1125,14 +1137,16 @@ async fn handle_schema_change(
 
                         info!("Created local file: {}", file_path.display());
 
-                        // Spawn sync tasks for the new file
-                        spawn_file_sync_tasks(
-                            client.clone(),
-                            server.to_string(),
-                            sync_node_id,
-                            sync_file_path,
-                            sync_state,
-                        );
+                        // Spawn sync tasks for the new file (only if requested)
+                        if spawn_tasks {
+                            spawn_file_sync_tasks(
+                                client.clone(),
+                                server.to_string(),
+                                sync_node_id,
+                                sync_file_path,
+                                sync_state,
+                            );
+                        }
                     }
                 }
             }
