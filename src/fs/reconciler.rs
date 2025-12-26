@@ -195,7 +195,14 @@ impl FilesystemReconciler {
             return Err(FsError::UnsupportedVersion(schema.version));
         }
 
-        // 3. Collect all entries and node-backed dirs from schema
+        // 3. Validate root is a directory (if present)
+        if let Some(ref root) = schema.root {
+            if !matches!(root, Entry::Dir(_)) {
+                return Err(FsError::SchemaError("root must be a directory".to_string()));
+            }
+        }
+
+        // 4. Collect all entries and node-backed dirs from schema
         let mut node_backed_dirs = HashSet::new();
         let mut recursion_stack = HashSet::new(); // Track current recursion path for cycle detection
         let entries = if let Some(ref root) = schema.root {
@@ -205,7 +212,7 @@ impl FilesystemReconciler {
             vec![]
         };
 
-        // 4. For each entry, ensure node exists
+        // 5. For each entry, ensure node exists
         let mut known = self.known_nodes.write().await;
         for (path, node_id, content_type) in entries {
             let nid = NodeId::new(&node_id);
@@ -225,7 +232,7 @@ impl FilesystemReconciler {
             known.insert(node_id.clone());
         }
 
-        // 5. Update last valid schema
+        // 6. Update last valid schema
         *self.last_valid_schema.write().await = Some(schema);
 
         Ok(node_backed_dirs)
@@ -302,7 +309,14 @@ impl FilesystemReconciler {
             return Err(FsError::UnsupportedVersion(schema.version));
         }
 
-        // 3. Collect all entries from schema (with cycle detection)
+        // 3. Validate root is a directory (if present)
+        if let Some(ref root) = schema.root {
+            if !matches!(root, Entry::Dir(_)) {
+                return Err(FsError::SchemaError("root must be a directory".to_string()));
+            }
+        }
+
+        // 4. Collect all entries from schema (with cycle detection)
         let mut ignored_dirs = HashSet::new();
         let mut recursion_stack = HashSet::new();
         let entries = if let Some(ref root) = schema.root {
@@ -312,7 +326,7 @@ impl FilesystemReconciler {
             vec![]
         };
 
-        // 4. For each entry, ensure node exists
+        // 5. For each entry, ensure node exists
         let mut known = self.known_nodes.write().await;
         for (path, node_id, content_type) in entries {
             let nid = NodeId::new(&node_id);
@@ -334,7 +348,7 @@ impl FilesystemReconciler {
             known.insert(node_id.clone());
         }
 
-        // 5. Update last valid schema
+        // 6. Update last valid schema
         *self.last_valid_schema.write().await = Some(schema);
 
         Ok(())

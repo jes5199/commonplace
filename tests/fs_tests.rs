@@ -222,6 +222,32 @@ async fn test_reconciler_rejects_unsupported_version() {
     assert!(result.is_err());
 }
 
+/// Test that non-directory root is rejected.
+#[tokio::test]
+async fn test_reconciler_rejects_non_directory_root() {
+    let registry = Arc::new(NodeRegistry::new());
+    let fs_root_id = NodeId::new("test-fs");
+
+    registry
+        .get_or_create_document(&fs_root_id, ContentType::Json)
+        .await
+        .unwrap();
+
+    let reconciler = Arc::new(FilesystemReconciler::new(
+        fs_root_id.clone(),
+        registry.clone(),
+    ));
+
+    // Root is a doc instead of a dir
+    let content = r#"{
+        "version": 1,
+        "root": { "type": "doc" }
+    }"#;
+
+    let result = reconciler.reconcile(content).await;
+    assert!(result.is_err(), "non-directory root should be rejected");
+}
+
 /// Test nested directories.
 #[tokio::test]
 async fn test_reconciler_nested_dirs() {
