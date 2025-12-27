@@ -8,6 +8,7 @@ pub mod events;
 pub mod fs;
 pub mod node;
 pub mod replay;
+pub mod router;
 pub mod sse;
 pub mod store;
 pub mod sync;
@@ -17,6 +18,7 @@ use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
 use node::{NodeId, NodeRegistry, ObservableNode};
+use router::RouterManager;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -32,6 +34,8 @@ pub struct RouterConfig {
     pub commit_store: Option<CommitStore>,
     /// Node ID for filesystem root document
     pub fs_root: Option<String>,
+    /// Node IDs for router documents
+    pub routers: Vec<String>,
 }
 
 /// Create a router with the given configuration.
@@ -79,6 +83,42 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             }
             Err(e) => {
                 tracing::error!("Failed to create fs-root node: {}", e);
+            }
+        }
+    }
+
+    // Initialize router documents
+    for router_id_str in config.routers {
+        let node_id = NodeId::new(&router_id_str);
+
+        // Get or create the router document node
+        // Use Json type since router documents are JSON
+        match node_registry
+            .get_or_create_document(&node_id, ContentType::Json)
+            .await
+        {
+            Ok(router_node) => {
+                tracing::info!("Router document initialized at node: {}", router_id_str);
+
+                // Create and start the router manager
+                let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
+
+                // Start watching (spawns background task)
+                manager.clone().start().await;
+
+                // Perform initial wiring
+                if let Some(observable) = router_node.as_any().downcast_ref::<node::DocumentNode>()
+                {
+                    match observable.get_content().await {
+                        Ok(content) if !content.is_empty() && content != "{}" => {
+                            manager.apply_wiring().await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to create router node {}: {}", router_id_str, e);
             }
         }
     }
