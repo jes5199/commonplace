@@ -198,10 +198,12 @@ impl RouterManager {
             managed.keys().cloned().collect()
         };
 
-        // Find wires to add - use desired_wires vec to preserve order
+        // Find wires to add - use desired_wires vec to preserve order, but dedupe to avoid
+        // creating multiple wires for duplicate edges in the schema
+        let mut seen_wires = HashSet::new();
         let to_add: Vec<WireKey> = desired_wires
             .into_iter()
-            .filter(|w| !current_wires.contains(w))
+            .filter(|w| !current_wires.contains(w) && seen_wires.insert(w.clone()))
             .collect();
         let to_remove: Vec<WireKey> = current_wires.difference(&desired_set).cloned().collect();
 
