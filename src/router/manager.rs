@@ -121,9 +121,7 @@ impl RouterManager {
             return Err(RouterError::UnsupportedVersion(schema.version));
         }
 
-        schema
-            .validate()
-            .map_err(RouterError::SchemaError)?;
+        schema.validate().map_err(RouterError::SchemaError)?;
 
         // 3. Create nodes from hints (if they don't exist)
         for (node_id, spec) in &schema.nodes {
@@ -242,8 +240,7 @@ impl RouterManager {
                     .await;
                 }
                 Err(e) => {
-                    self.emit_error(RouterError::NodeError(e.to_string()))
-                        .await;
+                    self.emit_error(RouterError::NodeError(e.to_string())).await;
                 }
             }
         }
@@ -309,23 +306,17 @@ mod tests {
         registry.register(router.clone()).await.unwrap();
 
         // Set router content with edge
-        let content = r#"{"version": 1, "edges": [{"from": "doc-a", "to": "doc-b", "port": "blue"}]}"#;
-        router
-            .apply_state(&make_text_update(content))
-            .unwrap();
+        let content =
+            r#"{"version": 1, "edges": [{"from": "doc-a", "to": "doc-b", "port": "blue"}]}"#;
+        router.apply_state(&make_text_update(content)).unwrap();
 
         // Create and run router manager
-        let manager = Arc::new(RouterManager::new(
-            NodeId::new("router"),
-            registry.clone(),
-        ));
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
 
         manager.apply_wiring().await;
 
         // Verify wire was created
-        let wirings = registry
-            .get_outgoing_wirings(&NodeId::new("doc-a"))
-            .await;
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
         assert_eq!(wirings.len(), 1);
         assert_eq!(wirings[0].1, NodeId::new("doc-b"));
     }
@@ -348,16 +339,11 @@ mod tests {
         let content1 = r#"{"version": 1, "edges": [{"from": "doc-a", "to": "doc-b"}]}"#;
         router.apply_state(&make_text_update(content1)).unwrap();
 
-        let manager = Arc::new(RouterManager::new(
-            NodeId::new("router"),
-            registry.clone(),
-        ));
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
         manager.apply_wiring().await;
 
         // Verify wire exists
-        let wirings = registry
-            .get_outgoing_wirings(&NodeId::new("doc-a"))
-            .await;
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
         assert_eq!(wirings.len(), 1);
 
         // Update content to remove edge - need to replace text entirely
@@ -367,9 +353,7 @@ mod tests {
         manager.apply_wiring().await;
 
         // Verify wire was removed
-        let wirings = registry
-            .get_outgoing_wirings(&NodeId::new("doc-a"))
-            .await;
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
         assert_eq!(wirings.len(), 0);
     }
 
@@ -391,10 +375,7 @@ mod tests {
         }"#;
         router.apply_state(&make_text_update(content)).unwrap();
 
-        let manager = Arc::new(RouterManager::new(
-            NodeId::new("router"),
-            registry.clone(),
-        ));
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
         manager.apply_wiring().await;
 
         // Verify node was created
@@ -430,12 +411,12 @@ mod tests {
 
         // Verify content was set
         let router_content = router.get_content().await.unwrap();
-        assert!(!router_content.is_empty(), "Router content should not be empty");
+        assert!(
+            !router_content.is_empty(),
+            "Router content should not be empty"
+        );
 
-        let manager = Arc::new(RouterManager::new(
-            NodeId::new("router"),
-            registry.clone(),
-        ));
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
         manager.apply_wiring().await;
 
         // Check managed wires
@@ -443,23 +424,26 @@ mod tests {
 
         // First two edges should succeed, third should fail (cycle)
         // We should have 2 wires managed (A->B and B->C)
-        assert_eq!(managed.len(), 2, "Expected 2 managed wires, got {}", managed.len());
+        assert_eq!(
+            managed.len(),
+            2,
+            "Expected 2 managed wires, got {}",
+            managed.len()
+        );
 
         // Verify wires in registry as well
-        let wirings_a = registry
-            .get_outgoing_wirings(&NodeId::new("doc-a"))
-            .await;
-        let wirings_b = registry
-            .get_outgoing_wirings(&NodeId::new("doc-b"))
-            .await;
-        let wirings_c = registry
-            .get_outgoing_wirings(&NodeId::new("doc-c"))
-            .await;
+        let wirings_a = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        let wirings_b = registry.get_outgoing_wirings(&NodeId::new("doc-b")).await;
+        let wirings_c = registry.get_outgoing_wirings(&NodeId::new("doc-c")).await;
 
         // A -> B and B -> C should exist, C -> A should be skipped
         assert_eq!(wirings_a.len(), 1, "Expected 1 wire from A");
         assert_eq!(wirings_b.len(), 1, "Expected 1 wire from B");
-        assert_eq!(wirings_c.len(), 0, "Expected 0 wires from C (cycle prevented)");
+        assert_eq!(
+            wirings_c.len(),
+            0,
+            "Expected 0 wires from C (cycle prevented)"
+        );
     }
 
     #[tokio::test]
@@ -472,10 +456,7 @@ mod tests {
         let content = r#"{"version": 2, "edges": []}"#;
         router.apply_state(&make_text_update(content)).unwrap();
 
-        let manager = Arc::new(RouterManager::new(
-            NodeId::new("router"),
-            registry.clone(),
-        ));
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
 
         // This should emit an error but not crash
         manager.apply_wiring().await;
