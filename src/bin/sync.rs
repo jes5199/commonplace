@@ -189,22 +189,55 @@ fn create_yjs_text_update(content: &str) -> String {
     base64_encode(&update)
 }
 
-/// Create a Yjs update that sets the full map content from JSON
-fn create_yjs_map_update(json_content: &str) -> Result<String, serde_json::Error> {
-    let value: serde_json::Value = serde_json::from_str(json_content)?;
+/// Create a Yjs update that applies a diff between old and new JSON content.
+/// This properly handles both insertions/updates AND deletions.
+///
+/// When old_json is None (first push), this behaves like create_yjs_map_update.
+/// When old_json is Some, it compares keys and removes deleted ones.
+fn create_yjs_map_diff_update(
+    old_json: Option<&str>,
+    new_json: &str,
+) -> Result<String, serde_json::Error> {
+    let new_value: serde_json::Value = serde_json::from_str(new_json)?;
+    let old_value: Option<serde_json::Value> = match old_json {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).ok(),
+        _ => None,
+    };
+
     let doc = Doc::with_client_id(1);
     let map = doc.get_or_insert_map(TEXT_ROOT_NAME);
+
     let update = {
         let mut txn = doc.transact_mut();
-        // Set each top-level key from the JSON object
-        if let serde_json::Value::Object(obj) = value {
+
+        // Get old and new keys
+        let old_keys: std::collections::HashSet<String> = old_value
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let new_obj = new_value.as_object();
+        let new_keys: std::collections::HashSet<String> = new_obj
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Remove keys that exist in old but not in new
+        for key in old_keys.difference(&new_keys) {
+            map.remove(&mut txn, key);
+        }
+
+        // Insert/update keys from new
+        if let Some(obj) = new_obj {
             for (key, val) in obj {
-                let any_val = json_value_to_any(val);
+                let any_val = json_value_to_any(val.clone());
                 map.insert(&mut txn, key.as_str(), any_val);
             }
         }
+
         txn.encode_update_v1()
     };
+
     Ok(base64_encode(&update))
 }
 
@@ -910,15 +943,29 @@ async fn run_directory_mode(
 ///
 /// Uses Y.Map updates for proper CRDT support. The edit endpoint is always used
 /// because the replace endpoint only supports text content type.
+///
+/// This function properly handles deletions by:
+/// 1. Fetching the current server content
+/// 2. Comparing old keys vs new keys
+/// 3. Creating an update that removes missing keys and inserts new ones
 async fn push_schema_to_server(
     client: &Client,
     server: &str,
     fs_root_id: &str,
     schema_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Always use edit endpoint with Y.Map update for JSON schemas
-    // (replace endpoint only supports text content type)
-    let update = create_yjs_map_update(schema_json)
+    // First fetch current server content to detect deletions
+    let head_url = format!("{}/nodes/{}/head", server, encode_node_id(fs_root_id));
+    let head_resp = client.get(&head_url).send().await?;
+    let old_content = if head_resp.status().is_success() {
+        let head: HeadResponse = head_resp.json().await?;
+        Some(head.content)
+    } else {
+        None
+    };
+
+    // Create an update that properly handles deletions
+    let update = create_yjs_map_diff_update(old_content.as_deref(), schema_json)
         .map_err(|e| format!("Failed to create map update: {}", e))?;
     let edit_url = format!("{}/nodes/{}/edit", server, encode_node_id(fs_root_id));
     let edit_req = EditRequest {
