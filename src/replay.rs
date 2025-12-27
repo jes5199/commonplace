@@ -8,8 +8,8 @@ use crate::commit::Commit;
 use crate::document::ContentType;
 use crate::store::{CommitStore, StoreError};
 use std::collections::HashSet;
-use yrs::updates::decoder::Decode;
 use yrs::types::ToJson;
+use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact};
 
 /// Text root name used in Yrs documents (must match DocumentNode)
