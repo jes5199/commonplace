@@ -1186,8 +1186,8 @@ async fn handle_schema_change(
         }
     };
 
-    // Collect all paths from schema
-    let mut schema_paths: Vec<String> = Vec::new();
+    // Collect all paths from schema (with explicit node_id if present)
+    let mut schema_paths: Vec<(String, Option<String>)> = Vec::new();
     if let Some(ref root) = schema.root {
         collect_paths_from_entry(root, "", &mut schema_paths);
     }
@@ -1198,10 +1198,13 @@ async fn handle_schema_change(
         states.keys().cloned().collect()
     };
 
-    for path in &schema_paths {
+    for (path, explicit_node_id) in &schema_paths {
         if !known_paths.contains(path) {
             // New file from server - create local file and fetch content
-            let node_id = format!("{}:{}", fs_root_id, path);
+            // Use explicit node_id if present, otherwise derive from path
+            let node_id = explicit_node_id
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}", fs_root_id, path));
             let file_path = directory.join(path);
 
             info!(
@@ -1292,8 +1295,13 @@ async fn handle_schema_change(
     Ok(())
 }
 
-/// Recursively collect file paths from an entry
-fn collect_paths_from_entry(entry: &Entry, prefix: &str, paths: &mut Vec<String>) {
+/// Recursively collect file paths from an entry, including explicit node_id if present
+/// Returns Vec<(path, explicit_node_id)> where explicit_node_id is Some if DocEntry has node_id
+fn collect_paths_from_entry(
+    entry: &Entry,
+    prefix: &str,
+    paths: &mut Vec<(String, Option<String>)>,
+) {
     match entry {
         Entry::Dir(dir) => {
             if let Some(ref entries) = dir.entries {
@@ -1307,8 +1315,8 @@ fn collect_paths_from_entry(entry: &Entry, prefix: &str, paths: &mut Vec<String>
                 }
             }
         }
-        Entry::Doc(_) => {
-            paths.push(prefix.to_string());
+        Entry::Doc(doc) => {
+            paths.push((prefix.to_string(), doc.node_id.clone()));
         }
     }
 }
