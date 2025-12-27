@@ -210,24 +210,38 @@ fn create_yjs_map_diff_update(
     let update = {
         let mut txn = doc.transact_mut();
 
-        // Get old and new keys
-        let old_keys: std::collections::HashSet<String> = old_value
-            .as_ref()
-            .and_then(|v| v.as_object())
+        // Get old and new key/value pairs
+        let old_obj = old_value.as_ref().and_then(|v| v.as_object());
+        let new_obj = new_value.as_object();
+
+        let old_keys: std::collections::HashSet<String> = old_obj
             .map(|obj| obj.keys().cloned().collect())
             .unwrap_or_default();
-
-        let new_obj = new_value.as_object();
         let new_keys: std::collections::HashSet<String> = new_obj
             .map(|obj| obj.keys().cloned().collect())
             .unwrap_or_default();
 
-        // Remove keys that exist in old but not in new
-        for key in old_keys.difference(&new_keys) {
+        // Keys to delete (in old but not in new)
+        let deleted_keys: Vec<&String> = old_keys.difference(&new_keys).collect();
+
+        // CRITICAL: For yrs Map.remove() to work, the key must exist in the CRDT.
+        // First insert old values for keys we're about to delete (creates CRDT entries).
+        // Then remove them (creates tombstones). Then insert new keys.
+        if let Some(old) = old_obj {
+            for key in &deleted_keys {
+                if let Some(val) = old.get(*key) {
+                    let any_val = json_value_to_any(val.clone());
+                    map.insert(&mut txn, key.as_str(), any_val);
+                }
+            }
+        }
+
+        // Now remove deleted keys (they exist in the CRDT, so this creates tombstones)
+        for key in &deleted_keys {
             map.remove(&mut txn, key);
         }
 
-        // Insert/update keys from new
+        // Insert/update keys from new schema
         if let Some(obj) = new_obj {
             for (key, val) in obj {
                 let any_val = json_value_to_any(val.clone());
