@@ -167,7 +167,32 @@ impl RouterManager {
         // Convert to set for comparison
         let desired_set: HashSet<WireKey> = desired_wires.iter().cloned().collect();
 
-        // 5. Diff against current managed wires
+        // 5. Prune stale entries from managed_wires (handles external unwiring)
+        {
+            let mut managed = self.managed_wires.write().await;
+            let stale_keys: Vec<WireKey> = {
+                let mut stale = Vec::new();
+                for (wire_key, sub_id) in managed.iter() {
+                    // Check if this wire still exists in the registry
+                    let from_id = NodeId::new(&wire_key.from);
+                    let actual_wires = self.registry.get_outgoing_wirings(&from_id).await;
+                    if !actual_wires.iter().any(|(sid, _)| sid == sub_id) {
+                        stale.push(wire_key.clone());
+                    }
+                }
+                stale
+            };
+            for key in stale_keys {
+                tracing::debug!(
+                    "Pruning stale managed wire: {} -> {} (externally removed)",
+                    key.from,
+                    key.to
+                );
+                managed.remove(&key);
+            }
+        }
+
+        // 6. Diff against current managed wires
         let current_wires: HashSet<WireKey> = {
             let managed = self.managed_wires.read().await;
             managed.keys().cloned().collect()
@@ -499,5 +524,52 @@ mod tests {
         // Schema should not be stored due to error
         let last_schema = manager.last_valid_schema.read().await;
         assert!(last_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_router_recreates_externally_unwired() {
+        let registry = Arc::new(NodeRegistry::new());
+
+        // Create two document nodes
+        let doc_a = Arc::new(DocumentNode::new("doc-a", ContentType::Text));
+        let doc_b = Arc::new(DocumentNode::new("doc-b", ContentType::Text));
+        registry.register(doc_a).await.unwrap();
+        registry.register(doc_b).await.unwrap();
+
+        // Create router node as Text type
+        let router = Arc::new(DocumentNode::new("router", ContentType::Text));
+        registry.register(router.clone()).await.unwrap();
+
+        // Initial content with edge
+        let content = r#"{"version": 1, "edges": [{"from": "doc-a", "to": "doc-b"}]}"#;
+        router.apply_state(&make_text_update(content)).unwrap();
+
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
+        manager.apply_wiring().await;
+
+        // Verify wire exists
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        assert_eq!(wirings.len(), 1, "wire should exist after first apply");
+        let sub_id = wirings[0].0.clone();
+
+        // Externally unwire (simulating DELETE /nodes/doc-a/wire/doc-b)
+        registry.unwire(&sub_id).await.ok();
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        assert_eq!(
+            wirings.len(),
+            0,
+            "wire should be removed after external unwire"
+        );
+
+        // Re-apply wiring - router should detect stale managed_wire and recreate
+        manager.apply_wiring().await;
+
+        // Wire should be recreated
+        let wirings = registry.get_outgoing_wirings(&NodeId::new("doc-a")).await;
+        assert_eq!(
+            wirings.len(),
+            1,
+            "wire should be recreated after external unwire"
+        );
     }
 }
