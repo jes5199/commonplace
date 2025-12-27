@@ -97,25 +97,13 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             .get_or_create_document(&node_id, ContentType::Json)
             .await
         {
-            Ok(router_node) => {
+            Ok(_) => {
                 tracing::info!("Router document initialized at node: {}", router_id_str);
 
                 // Create and start the router manager
+                // (start() performs initial wiring before listening for edits)
                 let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
-
-                // Start watching (spawns background task)
-                manager.clone().start().await;
-
-                // Perform initial wiring
-                if let Some(observable) = router_node.as_any().downcast_ref::<node::DocumentNode>()
-                {
-                    match observable.get_content().await {
-                        Ok(content) if !content.is_empty() && content != "{}" => {
-                            manager.apply_wiring().await;
-                        }
-                        _ => {}
-                    }
-                }
+                manager.start().await;
             }
             Err(e) => {
                 tracing::error!("Failed to create router node {}: {}", router_id_str, e);

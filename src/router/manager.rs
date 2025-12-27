@@ -62,6 +62,9 @@ impl RouterManager {
 
             tracing::info!("Router manager started for: {}", manager.router_id.0);
 
+            // Perform initial wiring before entering the loop (avoids race condition)
+            manager.apply_wiring().await;
+
             loop {
                 match blue_sub.recv().await {
                     Ok(_edit) => {
