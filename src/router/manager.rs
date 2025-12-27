@@ -132,11 +132,15 @@ impl RouterManager {
                 )));
             }
 
-            let content_type = spec
-                .content_type
-                .as_deref()
-                .and_then(ContentType::from_mime)
-                .unwrap_or(ContentType::Json);
+            let content_type = match &spec.content_type {
+                Some(mime) => ContentType::from_mime(mime).ok_or_else(|| {
+                    RouterError::SchemaError(format!(
+                        "Unsupported content_type '{}' for node '{}'",
+                        mime, node_id
+                    ))
+                })?,
+                None => ContentType::Json,
+            };
 
             let nid = NodeId::new(node_id);
             if self
@@ -462,6 +466,37 @@ mod tests {
         manager.apply_wiring().await;
 
         // Schema should not be stored
+        let last_schema = manager.last_valid_schema.read().await;
+        assert!(last_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_unsupported_content_type() {
+        let registry = Arc::new(NodeRegistry::new());
+
+        let router = Arc::new(DocumentNode::new("router", ContentType::Text));
+        registry.register(router.clone()).await.unwrap();
+
+        // Content with invalid content_type (typo: text/plan instead of text/plain)
+        let content = r#"{
+            "version": 1,
+            "nodes": {
+                "bad-node": { "type": "document", "content_type": "text/plan" }
+            },
+            "edges": []
+        }"#;
+        router.apply_state(&make_text_update(content)).unwrap();
+
+        let manager = Arc::new(RouterManager::new(NodeId::new("router"), registry.clone()));
+        manager.apply_wiring().await;
+
+        // Node should NOT be created (invalid content_type rejected)
+        assert!(
+            registry.get(&NodeId::new("bad-node")).await.is_none(),
+            "node with invalid content_type should NOT be created"
+        );
+
+        // Schema should not be stored due to error
         let last_schema = manager.last_valid_schema.read().await;
         assert!(last_schema.is_none());
     }
