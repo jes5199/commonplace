@@ -90,6 +90,31 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         }
     }
 
+    // Initialize MQTT service if configured
+    if let Some(mqtt_config) = config.mqtt {
+        match mqtt::MqttService::new(
+            mqtt_config,
+            node_registry.clone(),
+            commit_store.clone(),
+        )
+        .await
+        {
+            Ok(mqtt_service) => {
+                tracing::info!("MQTT service connected");
+                let mqtt_service = Arc::new(mqtt_service);
+                let service_for_loop = mqtt_service.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = service_for_loop.run().await {
+                        tracing::error!("MQTT event loop error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect MQTT service: {}", e);
+            }
+        }
+    }
+
     // Initialize router documents
     for router_id_str in config.routers {
         let node_id = NodeId::new(&router_id_str);
