@@ -6,11 +6,9 @@
 use clap::Parser;
 use commonplace_doc::{
     cli::StoreArgs,
-    document::ContentType,
+    document::{ContentType, DocumentStore},
     fs::FilesystemReconciler,
     mqtt::{topics::validate_extension, MqttConfig, MqttService},
-    node::{NodeId, NodeRegistry, ObservableNode},
-    router::RouterManager,
     store::CommitStore,
 };
 use std::sync::Arc;
@@ -32,7 +30,7 @@ async fn main() {
 
     tracing::info!("Starting commonplace-store");
 
-    // Validate that fs-root and router paths have valid extensions
+    // Validate that fs-root path has a valid extension
     // (required for MQTT topic parsing to work)
     if let Err(e) = validate_extension(&args.fs_root) {
         tracing::error!(
@@ -43,85 +41,36 @@ async fn main() {
         std::process::exit(1);
     }
 
-    for router_path in &args.routers {
-        if let Err(e) = validate_extension(router_path) {
-            tracing::error!(
-                "Invalid router path '{}': {}. Paths must have extensions like .json, .txt, etc.",
-                router_path,
-                e
-            );
-            std::process::exit(1);
-        }
-    }
-
     // Create commit store (required for store binary)
     tracing::info!("Using database at: {}", args.database.display());
     let commit_store =
         Arc::new(CommitStore::new(&args.database).expect("Failed to create commit store"));
 
-    // Create node registry
-    let node_registry = Arc::new(NodeRegistry::new());
+    // Create document store
+    let doc_store = Arc::new(DocumentStore::new());
 
     // Initialize filesystem root
-    let fs_root_id = NodeId::new(&args.fs_root);
     tracing::info!("Filesystem root: {}", args.fs_root);
 
-    // Get or create the fs-root document node (required)
-    let fs_node = match node_registry
-        .get_or_create_document(&fs_root_id, ContentType::Text)
-        .await
-    {
-        Ok(node) => {
-            tracing::info!("Filesystem root initialized at node: {}", args.fs_root);
-            node
-        }
-        Err(e) => {
-            tracing::error!("Failed to create fs-root node: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Get or create the fs-root document (required)
+    // Use Json type since the fs-root schema is a JSON map structure
+    let fs_doc = doc_store
+        .get_or_create_with_id(&args.fs_root, ContentType::Json)
+        .await;
+
+    tracing::info!("Filesystem root initialized at document: {}", args.fs_root);
 
     // Create filesystem reconciler
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        node_registry.clone(),
+        args.fs_root.clone(),
+        doc_store.clone(),
     ));
 
-    // Start watching for filesystem changes
-    reconciler.clone().start().await;
-
     // Perform initial reconciliation
-    if let Some(observable) = fs_node
-        .as_any()
-        .downcast_ref::<commonplace_doc::node::DocumentNode>()
-    {
-        match observable.get_content().await {
-            Ok(content) if !content.is_empty() && content != "{}" => {
-                if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
-                    tracing::warn!("Initial fs reconcile failed: {}", e);
-                    reconciler.emit_error(e, None).await;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Initialize router documents
-    for router_id_str in &args.routers {
-        let node_id = NodeId::new(router_id_str);
-
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Json)
-            .await
-        {
-            Ok(_) => {
-                tracing::info!("Router document initialized at node: {}", router_id_str);
-                let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
-                manager.start().await;
-            }
-            Err(e) => {
-                tracing::error!("Failed to create router node {}: {}", router_id_str, e);
-            }
+    let content = fs_doc.content.clone();
+    if !content.is_empty() && content != "{}" {
+        if let Err(e) = reconciler.reconcile(&content).await {
+            tracing::warn!("Initial fs reconcile failed: {}", e);
         }
     }
 
@@ -139,22 +88,44 @@ async fn main() {
     );
 
     // Connect to MQTT
-    let mqtt_service = match MqttService::new(
-        mqtt_config,
-        node_registry.clone(),
-        Some(commit_store.clone()),
-    )
-    .await
-    {
-        Ok(service) => {
-            tracing::info!("MQTT service connected");
-            Arc::new(service)
-        }
-        Err(e) => {
-            tracing::error!("Failed to connect MQTT service: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mqtt_service =
+        match MqttService::new(mqtt_config, doc_store.clone(), Some(commit_store.clone())).await {
+            Ok(service) => {
+                tracing::info!("MQTT service connected");
+                Arc::new(service)
+            }
+            Err(e) => {
+                tracing::error!("Failed to connect MQTT service: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    // Populate the handlers' fs_root_content cache for path->document ID resolution
+    mqtt_service
+        .edits_handler()
+        .set_fs_root_content(content.clone())
+        .await;
+    mqtt_service
+        .sync_handler()
+        .set_fs_root_content(content.clone())
+        .await;
+
+    // Set the fs-root path so handlers can resolve paths correctly
+    mqtt_service
+        .edits_handler()
+        .set_fs_root_path(args.fs_root.clone())
+        .await;
+    mqtt_service
+        .sync_handler()
+        .set_fs_root_path(args.fs_root.clone())
+        .await;
+
+    // Subscribe to store-level commands (e.g., create-document)
+    if let Err(e) = mqtt_service.subscribe_store_commands().await {
+        tracing::warn!("Failed to subscribe to store commands: {}", e);
+    } else {
+        tracing::info!("Subscribed to store commands");
+    }
 
     // Subscribe to fs-root document itself (so we receive updates to filesystem structure)
     if let Err(e) = mqtt_service.subscribe_path(&args.fs_root).await {
@@ -163,25 +134,11 @@ async fn main() {
         tracing::info!("Subscribed to fs-root path: {}", args.fs_root);
     }
 
-    // Subscribe to router documents
-    for router_id_str in &args.routers {
-        if let Err(e) = mqtt_service.subscribe_path(router_id_str).await {
-            tracing::warn!("Failed to subscribe to router {}: {}", router_id_str, e);
-        } else {
-            tracing::info!("Subscribed to router path: {}", router_id_str);
-        }
-    }
-
     // Subscribe to paths based on fs-root content
-    // Parse the fs-root JSON to get document paths
-    if let Some(observable) = fs_node
-        .as_any()
-        .downcast_ref::<commonplace_doc::node::DocumentNode>()
-    {
-        if let Ok(content) = observable.get_content().await {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                subscribe_to_paths(&mqtt_service, &json, "").await;
-            }
+    // Parse the versioned fs-root schema to get document paths
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(root) = json.get("root") {
+            subscribe_to_entry(&mqtt_service, root, "").await;
         }
     }
 
@@ -193,37 +150,58 @@ async fn main() {
     }
 }
 
-/// Recursively subscribe to document paths found in the fs-root JSON
-fn subscribe_to_paths<'a>(
+/// Recursively subscribe to document paths found in the versioned fs-root schema.
+///
+/// The schema format is:
+/// ```json
+/// {
+///   "version": 1,
+///   "root": {
+///     "type": "dir",
+///     "entries": {
+///       "notes": { "type": "dir", "entries": { "todo.txt": { "type": "doc" } } },
+///       "readme.txt": { "type": "doc" }
+///     }
+///   }
+/// }
+/// ```
+fn subscribe_to_entry<'a>(
     mqtt: &'a MqttService,
-    value: &'a serde_json::Value,
+    entry: &'a serde_json::Value,
     prefix: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if let serde_json::Value::Object(map) = value {
-            for (key, val) in map {
-                // Skip metadata keys
-                if key.starts_with('_') {
-                    continue;
-                }
+        let entry_type = match entry.get("type").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => return,
+        };
 
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}/{}", prefix, key)
-                };
-
-                // If this key has an extension, it's a document - subscribe
-                if key.contains('.') {
-                    if let Err(e) = mqtt.subscribe_path(&path).await {
-                        tracing::warn!("Failed to subscribe to {}: {}", path, e);
+        match entry_type {
+            "doc" => {
+                // This is a document - subscribe to its path
+                if !prefix.is_empty() {
+                    if let Err(e) = mqtt.subscribe_path(prefix).await {
+                        tracing::warn!("Failed to subscribe to {}: {}", prefix, e);
                     } else {
-                        tracing::info!("Subscribed to path: {}", path);
+                        tracing::info!("Subscribed to path: {}", prefix);
                     }
-                } else {
-                    // It's a directory, recurse
-                    subscribe_to_paths(mqtt, val, &path).await;
                 }
+            }
+            "dir" => {
+                // This is a directory - recurse into entries
+                if let Some(serde_json::Value::Object(map)) = entry.get("entries") {
+                    for (name, child) in map {
+                        let path = if prefix.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", prefix, name)
+                        };
+                        subscribe_to_entry(mqtt, child, &path).await;
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("Unknown entry type: {}", entry_type);
             }
         }
     })

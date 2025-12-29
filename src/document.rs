@@ -124,6 +124,54 @@ impl DocumentStore {
         documents.get(id).cloned()
     }
 
+    /// Get an existing document or create one with the given ID.
+    /// Unlike create_document, this uses a specific ID instead of generating a new UUID.
+    pub async fn get_or_create_with_id(&self, id: &str, content_type: ContentType) -> Document {
+        // First check with read lock
+        {
+            let documents = self.documents.read().await;
+            if let Some(doc) = documents.get(id) {
+                return doc.clone();
+            }
+        }
+
+        // Not found, create with write lock
+        let mut documents = self.documents.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(doc) = documents.get(id) {
+            return doc.clone();
+        }
+
+        // Create new document with this ID
+        let ydoc = yrs::Doc::with_client_id(Self::DEFAULT_YDOC_CLIENT_ID);
+        match content_type {
+            ContentType::Text => {
+                ydoc.get_or_insert_text(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Json => {
+                ydoc.get_or_insert_map(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::JsonArray => {
+                ydoc.get_or_insert_array(Self::TEXT_ROOT_NAME);
+            }
+            ContentType::Xml => {
+                ydoc.get_or_insert_xml_fragment(Self::TEXT_ROOT_NAME);
+            }
+        }
+
+        let content = content_type.default_content();
+
+        let doc = Document {
+            content,
+            content_type,
+            ydoc: Some(ydoc),
+        };
+
+        documents.insert(id.to_string(), doc.clone());
+        doc
+    }
+
     pub async fn delete_document(&self, id: &str) -> bool {
         let mut documents = self.documents.write().await;
         documents.remove(id).is_some()
@@ -186,6 +234,16 @@ impl DocumentStore {
         Ok(())
     }
 
+    /// Get the current Yjs state as bytes (for syncing).
+    /// Returns the full document state encoded as a Yjs update.
+    pub async fn get_yjs_state(&self, id: &str) -> Option<Vec<u8>> {
+        let documents = self.documents.read().await;
+        let doc = documents.get(id)?;
+        let ydoc = doc.ydoc.as_ref()?;
+        let txn = ydoc.transact();
+        Some(txn.encode_state_as_update_v1(&yrs::StateVector::default()))
+    }
+
     fn wrap_xml_root(inner: &str) -> String {
         if inner.is_empty() {
             return format!("{}<root/>", Self::XML_HEADER);
@@ -200,10 +258,136 @@ impl DocumentStore {
     }
 }
 
+/// Resolve a path to a document ID by parsing fs-root JSON content.
+///
+/// The fs-root uses a versioned schema:
+/// ```json
+/// {
+///   "version": 1,
+///   "root": {
+///     "type": "dir",
+///     "entries": {
+///       "notes": { "type": "dir", "entries": { "todo.txt": { "type": "doc", "node_id": "abc-123" } } }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Document ID is either:
+/// - Explicit `node_id` in the schema
+/// - Derived as `<fs_root_id>:<path>` if not specified
+///
+/// Returns None if path not found or JSON invalid.
+pub fn resolve_path_to_uuid(fs_root_content: &str, path: &str, fs_root_id: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(fs_root_content).ok()?;
+
+    // Parse the versioned schema
+    let root = json.get("root")?;
+    let root_type = root.get("type")?.as_str()?;
+    if root_type != "dir" {
+        return None;
+    }
+
+    // Navigate through the path
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut current = root;
+
+    for (i, part) in parts.iter().enumerate() {
+        let entries = current.get("entries")?;
+        current = entries.get(*part)?;
+
+        let entry_type = current.get("type")?.as_str()?;
+
+        // If this is the last part and it's a doc, we found it
+        if i == parts.len() - 1 {
+            if entry_type != "doc" {
+                return None; // Path points to a directory, not a document
+            }
+            // Return node_id if set, otherwise derive from path
+            return current
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some(format!("{}:{}", fs_root_id, path)));
+        }
+
+        // Not the last part, so this should be a directory
+        if entry_type != "dir" {
+            return None;
+        }
+    }
+
+    None
+}
+
 #[derive(Debug)]
 pub enum ApplyError {
     NotFound,
     MissingYDoc,
     InvalidUpdate(String),
     Serialization(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_path_to_uuid() {
+        let fs_root = r#"{
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "notes": {
+                        "type": "dir",
+                        "entries": {
+                            "todo.txt": { "type": "doc", "node_id": "abc-123" },
+                            "ideas.md": { "type": "doc" }
+                        }
+                    },
+                    "readme.txt": { "type": "doc", "node_id": "ghi-789" }
+                }
+            }
+        }"#;
+
+        // Explicit node_id is returned
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "notes/todo.txt", "fs-root.json"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "readme.txt", "fs-root.json"),
+            Some("ghi-789".to_string())
+        );
+
+        // Derived document ID when no node_id
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "notes/ideas.md", "fs-root.json"),
+            Some("fs-root.json:notes/ideas.md".to_string())
+        );
+
+        // Path not found
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "nonexistent.txt", "fs-root.json"),
+            None
+        );
+
+        // Path points to directory, not document
+        assert_eq!(resolve_path_to_uuid(fs_root, "notes", "fs-root.json"), None);
+    }
+
+    #[tokio::test]
+    async fn test_create_document_returns_uuid() {
+        let store = DocumentStore::new();
+        let uuid = store.create_document(ContentType::Text).await;
+
+        // UUID should be valid format (36 chars with dashes)
+        assert!(uuid.len() == 36);
+        assert!(uuid.contains('-'));
+
+        // Document should be retrievable
+        let doc = store.get_document(&uuid).await;
+        assert!(doc.is_some());
+    }
 }

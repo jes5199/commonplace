@@ -1,0 +1,60 @@
+# Sync Integration Test Results
+Date: 2025-12-29
+
+## Test Setup
+- Server: commonplace-server with --database
+- Two sync clients (A and B) syncing same node via HTTP
+
+## Results
+
+### PASS: A → B Sync
+- File A edited with "line 2 from A"
+- File B received the update within 4 seconds
+- Server correctly stored commit and broadcast via SSE
+
+### PARTIAL: B → A Sync
+- File B received A's content correctly
+- File B was edited with "line 3 from B" appended
+- File A did NOT receive B's update
+
+### Analysis
+The server API endpoints are working correctly:
+- POST /nodes - Creates node ✓
+- GET /nodes/:id - Returns node info ✓
+- GET /nodes/:id/head - Returns HEAD commit, content, and Yjs state ✓
+- POST /nodes/:id/edit - Accepts and stores Yjs updates ✓
+- GET /sse/nodes/:id - Streams edit events ✓
+
+The B → A sync failure appears to be in the sync client, not the server:
+- Sync B's log shows no "Creating commit" entry after file edit
+- Likely issue: file watcher or echo detection in sync client
+
+Filed as: CP-5p5
+
+## Logs
+
+### Sync A Log
+```
+INFO commonplace_sync: Starting commonplace-sync (file mode)
+INFO commonplace_sync: Connected to node
+INFO commonplace_sync: Initial sync complete: empty document (no commits yet)
+INFO commonplace_sync: Watching file
+INFO commonplace_sync: SSE connection opened
+INFO commonplace_sync: Creating initial commit...
+INFO commonplace_sync: Created initial commit: 14 bytes (cid: 1f1429b8)
+INFO commonplace_sync: Downloaded update: 14 bytes at 1f1429b8
+```
+
+### Sync B Log
+```
+INFO commonplace_sync: Starting commonplace-sync (file mode)
+INFO commonplace_sync: Connected to node
+INFO commonplace_sync: Initial sync complete: empty document (no commits yet)
+INFO commonplace_sync: SSE connection opened
+INFO commonplace_sync: Watching file
+INFO commonplace_sync: Downloaded update: 14 bytes at 1f1429b8
+```
+
+## Conclusion
+Server /nodes endpoints are functional. One-way sync (A→B) works.
+Bidirectional sync requires sync client investigation (CP-5p5).

@@ -1,16 +1,16 @@
 //! Edits port handler.
 //!
 //! Subscribes to `{path}/edits` topics, persists Yjs updates to the commit store,
-//! and applies them to document nodes.
+//! and applies them to documents.
 //!
 //! IMPORTANT: The doc store does NOT re-emit edits. MQTT broker handles fanout.
 
 use crate::commit::Commit;
+use crate::document::{resolve_path_to_uuid, DocumentStore};
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::EditMessage;
 use crate::mqtt::topics::{content_type_for_path, Topic};
 use crate::mqtt::MqttError;
-use crate::node::{Edit, NodeId, NodeRegistry};
 use crate::store::CommitStore;
 use rumqttc::QoS;
 use std::collections::HashSet;
@@ -21,8 +21,12 @@ use tracing::debug;
 /// Handler for the edits port.
 pub struct EditsHandler {
     client: Arc<MqttClient>,
-    node_registry: Arc<NodeRegistry>,
+    document_store: Arc<DocumentStore>,
     commit_store: Option<Arc<CommitStore>>,
+    /// Cache of fs-root JSON content for path→UUID resolution.
+    fs_root_content: RwLock<String>,
+    /// The fs-root path, so we can refresh the cache when it's edited.
+    fs_root_path: RwLock<Option<String>>,
     subscribed_paths: RwLock<HashSet<String>>,
 }
 
@@ -30,15 +34,29 @@ impl EditsHandler {
     /// Create a new edits handler.
     pub fn new(
         client: Arc<MqttClient>,
-        node_registry: Arc<NodeRegistry>,
+        document_store: Arc<DocumentStore>,
         commit_store: Option<Arc<CommitStore>>,
     ) -> Self {
         Self {
             client,
-            node_registry,
+            document_store,
             commit_store,
+            fs_root_content: RwLock::new(String::new()),
+            fs_root_path: RwLock::new(None),
             subscribed_paths: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Update the cached fs-root content for path resolution.
+    pub async fn set_fs_root_content(&self, content: String) {
+        let mut fs_root = self.fs_root_content.write().await;
+        *fs_root = content;
+    }
+
+    /// Set the fs-root path so we can refresh the cache when it's edited.
+    pub async fn set_fs_root_path(&self, path: String) {
+        let mut fs_root_path = self.fs_root_path.write().await;
+        *fs_root_path = Some(path);
     }
 
     /// Subscribe to edits for a path.
@@ -75,7 +93,7 @@ impl EditsHandler {
     /// This:
     /// 1. Parses the EditMessage
     /// 2. Creates a Commit and stores it (if commit_store is available)
-    /// 3. Applies the update to the DocumentNode
+    /// 3. Applies the Yjs update to the Document via DocumentStore
     ///
     /// IMPORTANT: Does NOT re-emit. MQTT broker handles fanout.
     pub async fn handle_edit(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
@@ -88,11 +106,36 @@ impl EditsHandler {
             topic.path, edit_msg.author
         );
 
+        // Check if this is an fs-root edit (special case: path IS the document ID)
+        let fs_root_path = self.fs_root_path.read().await;
+        let is_fs_root_edit = fs_root_path.as_ref() == Some(&topic.path);
+        let fs_root_id = fs_root_path.clone();
+        drop(fs_root_path);
+
+        // Resolve path to document ID:
+        // - For fs-root: the path IS the document ID
+        // - For other documents: resolve via fs-root content
+        let document_id = if is_fs_root_edit {
+            topic.path.clone()
+        } else {
+            let fs_root = self.fs_root_content.read().await;
+            let fs_root_id = fs_root_id.as_deref().unwrap_or("");
+            let uuid =
+                resolve_path_to_uuid(&fs_root, &topic.path, fs_root_id).ok_or_else(|| {
+                    MqttError::InvalidMessage(format!(
+                        "Path not mounted in fs-root: {}",
+                        topic.path
+                    ))
+                })?;
+            drop(fs_root);
+            uuid
+        };
+
         // Determine parents: use provided parents, or infer from current HEAD if empty
         let parents = if edit_msg.parents.is_empty() {
             // No parents provided - infer from current document HEAD
             if let Some(store) = &self.commit_store {
-                if let Ok(Some(head)) = store.get_document_head(&topic.path).await {
+                if let Ok(Some(head)) = store.get_document_head(&document_id).await {
                     vec![head]
                 } else {
                     vec![] // No HEAD yet, this is a root commit
@@ -118,44 +161,48 @@ impl EditsHandler {
         let cid = if let Some(store) = &self.commit_store {
             let cid = store.store_commit(&commit).await?;
 
-            // Update document head
-            // Use path as the document ID
-            store.set_document_head(&topic.path, &cid).await?;
+            // Update document head using the document ID (UUID or fs-root path)
+            store.set_document_head(&document_id, &cid).await?;
 
-            debug!("Stored commit {} for path {}", cid, topic.path);
+            debug!("Stored commit {} for document {}", cid, document_id);
             Some(cid)
         } else {
             None
         };
 
-        // Get or create the document node
-        let node_id = NodeId::new(&topic.path);
+        // Get the content type and ensure document exists
         let content_type = content_type_for_path(&topic.path)?;
+        let _doc = self
+            .document_store
+            .get_or_create_with_id(&document_id, content_type)
+            .await;
 
-        let node = self
-            .node_registry
-            .get_or_create_document(&node_id, content_type)
+        // Decode the base64 update and apply it to the document
+        let update_bytes = crate::b64::decode(&commit.update)
+            .map_err(|e| MqttError::InvalidMessage(format!("Invalid base64 update: {}", e)))?;
+
+        self.document_store
+            .apply_yjs_update(&document_id, &update_bytes)
             .await
-            .map_err(|e| MqttError::Node(e.to_string()))?;
-
-        // Create Edit and apply to node
-        // Note: We pass the commit without re-emitting
-        let edit = Edit {
-            source: NodeId::new("mqtt"),
-            commit: Arc::new(commit),
-        };
-
-        // Apply the edit to the node
-        // The node will update its internal state but we don't re-emit to MQTT
-        if let Err(e) = node.receive_edit(edit).await {
-            debug!("Error applying edit to node {}: {:?}", topic.path, e);
-        }
+            .map_err(|e| {
+                MqttError::InvalidMessage(format!("Failed to apply Yjs update: {:?}", e))
+            })?;
 
         debug!(
-            "Applied edit to node {} (cid: {:?})",
+            "Applied edit to document {} (path: {}, cid: {:?})",
+            document_id,
             topic.path,
             cid.as_deref().unwrap_or("none")
         );
+
+        // If this was an fs-root edit, refresh the fs-root content cache
+        if is_fs_root_edit {
+            if let Some(doc) = self.document_store.get_document(&document_id).await {
+                let mut fs_root = self.fs_root_content.write().await;
+                *fs_root = doc.content.clone();
+                debug!("Refreshed fs-root content cache after edit");
+            }
+        }
 
         Ok(())
     }

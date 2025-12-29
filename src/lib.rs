@@ -8,10 +8,8 @@ pub mod events;
 pub mod fs;
 pub mod http_gateway;
 pub mod mqtt;
-pub mod node;
 pub mod orchestrator;
 pub mod replay;
-pub mod router;
 pub mod sse;
 pub mod store;
 pub mod sync;
@@ -20,8 +18,6 @@ use axum::{routing::get, Router};
 use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
-use node::{NodeId, NodeRegistry, ObservableNode};
-use router::RouterManager;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -37,8 +33,6 @@ pub struct RouterConfig {
     pub commit_store: Option<CommitStore>,
     /// Node ID for filesystem root document
     pub fs_root: Option<String>,
-    /// Node IDs for router documents
-    pub routers: Vec<String>,
     /// MQTT configuration (if specified, enables MQTT transport)
     pub mqtt: Option<mqtt::MqttConfig>,
     /// Document paths to subscribe via MQTT (requires mqtt to be set)
@@ -50,57 +44,71 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
     let commit_store = config.commit_store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
-    let node_registry = Arc::new(NodeRegistry::new());
 
     // Initialize filesystem if --fs-root is specified
-    if let Some(ref fs_root_id) = config.fs_root {
-        let node_id = NodeId::new(fs_root_id);
+    // Capture fs-root content for MQTT handlers
+    let fs_root_context: Option<(String, String)> = if let Some(ref fs_root_id) = config.fs_root {
+        // Get or create the fs-root document
+        // Use Json type since the fs-root schema is a JSON map structure
+        let fs_doc = doc_store
+            .get_or_create_with_id(fs_root_id, ContentType::Json)
+            .await;
 
-        // Get or create the fs-root document node
-        // Use Text type since the edit system uses TEXT-based Yjs updates
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Text)
-            .await
-        {
-            Ok(fs_node) => {
-                tracing::info!("Filesystem root initialized at node: {}", fs_root_id);
+        tracing::info!("Filesystem root initialized at document: {}", fs_root_id);
 
-                // Create and start the reconciler
-                let reconciler = Arc::new(FilesystemReconciler::new(
-                    node_id.clone(),
-                    node_registry.clone(),
-                ));
+        // Create the reconciler
+        let reconciler = Arc::new(FilesystemReconciler::new(
+            fs_root_id.clone(),
+            doc_store.clone(),
+        ));
 
-                // Start watching (spawns background task)
-                reconciler.clone().start().await;
-
-                // Perform initial reconciliation with watcher registration
-                if let Some(observable) = fs_node.as_any().downcast_ref::<node::DocumentNode>() {
-                    match observable.get_content().await {
-                        Ok(content) if !content.is_empty() && content != "{}" => {
-                            if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
-                                tracing::warn!("Initial fs reconcile failed: {}", e);
-                                // Emit fs.error event so clients are notified
-                                reconciler.emit_error(e, None).await;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create fs-root node: {}", e);
+        // Perform initial reconciliation
+        let content = fs_doc.content.clone();
+        if !content.is_empty() && content != "{}" {
+            if let Err(e) = reconciler.reconcile(&content).await {
+                tracing::warn!("Initial fs reconcile failed: {}", e);
             }
         }
-    }
+
+        Some((fs_root_id.clone(), content))
+    } else {
+        None
+    };
 
     // Initialize MQTT service if configured
     if let Some(mqtt_config) = config.mqtt {
-        match mqtt::MqttService::new(mqtt_config, node_registry.clone(), commit_store.clone()).await
-        {
+        match mqtt::MqttService::new(mqtt_config, doc_store.clone(), commit_store.clone()).await {
             Ok(mqtt_service) => {
                 tracing::info!("MQTT service connected");
                 let mqtt_service = Arc::new(mqtt_service);
+
+                // Initialize fs-root caches on MQTT handlers if fs-root is configured
+                if let Some((ref fs_root_id, ref fs_root_content)) = fs_root_context {
+                    mqtt_service
+                        .edits_handler()
+                        .set_fs_root_content(fs_root_content.clone())
+                        .await;
+                    mqtt_service
+                        .edits_handler()
+                        .set_fs_root_path(fs_root_id.clone())
+                        .await;
+                    mqtt_service
+                        .sync_handler()
+                        .set_fs_root_content(fs_root_content.clone())
+                        .await;
+                    mqtt_service
+                        .sync_handler()
+                        .set_fs_root_path(fs_root_id.clone())
+                        .await;
+                    tracing::info!("MQTT handlers initialized with fs-root context");
+                }
+
+                // Subscribe to store-level commands (e.g., create-document)
+                if let Err(e) = mqtt_service.subscribe_store_commands().await {
+                    tracing::warn!("Failed to subscribe to store commands: {}", e);
+                } else {
+                    tracing::info!("MQTT subscribed to store commands");
+                }
 
                 // Subscribe to configured document paths
                 for path in &config.mqtt_subscribe {
@@ -125,44 +133,14 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         }
     }
 
-    // Initialize router documents
-    for router_id_str in config.routers {
-        let node_id = NodeId::new(&router_id_str);
-
-        // Get or create the router document node
-        // Use Json type since router documents are JSON
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Json)
-            .await
-        {
-            Ok(_) => {
-                tracing::info!("Router document initialized at node: {}", router_id_str);
-
-                // Create and start the router manager
-                // (start() performs initial wiring before listening for edits)
-                let manager = Arc::new(RouterManager::new(node_id.clone(), node_registry.clone()));
-                manager.start().await;
-            }
-            Err(e) => {
-                tracing::error!("Failed to create router node {}: {}", router_id_str, e);
-            }
-        }
-    }
-
     Router::new()
         .route("/health", get(health_check))
         .merge(api::router(
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            node_registry.clone(),
         ))
-        .merge(sse::router(
-            doc_store,
-            commit_store,
-            commit_broadcaster,
-            node_registry,
-        ))
+        .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
 }
 
@@ -172,7 +150,6 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
     let doc_store = Arc::new(DocumentStore::new());
     let commit_store = store.map(Arc::new);
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
-    let node_registry = Arc::new(NodeRegistry::new());
 
     Router::new()
         .route("/health", get(health_check))
@@ -180,14 +157,8 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             doc_store.clone(),
             commit_store.clone(),
             commit_broadcaster.clone(),
-            node_registry.clone(),
         ))
-        .merge(sse::router(
-            doc_store,
-            commit_store,
-            commit_broadcaster,
-            node_registry,
-        ))
+        .merge(sse::router(doc_store, commit_store, commit_broadcaster))
         .layer(CorsLayer::permissive())
 }
 
