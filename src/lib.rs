@@ -46,7 +46,8 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     let commit_broadcaster = commit_store.as_ref().map(|_| CommitBroadcaster::new(1024));
 
     // Initialize filesystem if --fs-root is specified
-    if let Some(ref fs_root_id) = config.fs_root {
+    // Capture fs-root content for MQTT handlers
+    let fs_root_context: Option<(String, String)> = if let Some(ref fs_root_id) = config.fs_root {
         // Get or create the fs-root document
         // Use Text type since the edit system uses TEXT-based Yjs updates
         let fs_doc = doc_store
@@ -62,13 +63,17 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         ));
 
         // Perform initial reconciliation
-        let content = fs_doc.content;
+        let content = fs_doc.content.clone();
         if !content.is_empty() && content != "{}" {
             if let Err(e) = reconciler.reconcile(&content).await {
                 tracing::warn!("Initial fs reconcile failed: {}", e);
             }
         }
-    }
+
+        Some((fs_root_id.clone(), content))
+    } else {
+        None
+    };
 
     // Initialize MQTT service if configured
     if let Some(mqtt_config) = config.mqtt {
@@ -76,6 +81,27 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             Ok(mqtt_service) => {
                 tracing::info!("MQTT service connected");
                 let mqtt_service = Arc::new(mqtt_service);
+
+                // Initialize fs-root caches on MQTT handlers if fs-root is configured
+                if let Some((ref fs_root_id, ref fs_root_content)) = fs_root_context {
+                    mqtt_service
+                        .edits_handler()
+                        .set_fs_root_content(fs_root_content.clone())
+                        .await;
+                    mqtt_service
+                        .edits_handler()
+                        .set_fs_root_path(fs_root_id.clone())
+                        .await;
+                    mqtt_service
+                        .sync_handler()
+                        .set_fs_root_content(fs_root_content.clone())
+                        .await;
+                    mqtt_service
+                        .sync_handler()
+                        .set_fs_root_path(fs_root_id.clone())
+                        .await;
+                    tracing::info!("MQTT handlers initialized with fs-root context");
+                }
 
                 // Subscribe to store-level commands (e.g., create-document)
                 if let Err(e) = mqtt_service.subscribe_store_commands().await {
