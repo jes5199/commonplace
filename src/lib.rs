@@ -49,9 +49,9 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     // Capture fs-root content for MQTT handlers
     let fs_root_context: Option<(String, String)> = if let Some(ref fs_root_id) = config.fs_root {
         // Get or create the fs-root document
-        // Use Text type since the edit system uses TEXT-based Yjs updates
+        // Use Json type since the fs-root schema is a JSON map structure
         let fs_doc = doc_store
-            .get_or_create_with_id(fs_root_id, ContentType::Text)
+            .get_or_create_with_id(fs_root_id, ContentType::Json)
             .await;
 
         tracing::info!("Filesystem root initialized at document: {}", fs_root_id);

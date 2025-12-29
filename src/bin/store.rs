@@ -53,8 +53,9 @@ async fn main() {
     tracing::info!("Filesystem root: {}", args.fs_root);
 
     // Get or create the fs-root document (required)
+    // Use Json type since the fs-root schema is a JSON map structure
     let fs_doc = doc_store
-        .get_or_create_with_id(&args.fs_root, ContentType::Text)
+        .get_or_create_with_id(&args.fs_root, ContentType::Json)
         .await;
 
     tracing::info!("Filesystem root initialized at document: {}", args.fs_root);
