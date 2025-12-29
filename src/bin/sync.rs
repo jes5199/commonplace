@@ -269,6 +269,9 @@ enum FileEvent {
 /// Text root name used in Yrs documents (must match server)
 const TEXT_ROOT_NAME: &str = "content";
 
+/// Filename for the local schema JSON file written during directory sync
+const SCHEMA_FILENAME: &str = ".commonplace.json";
+
 /// Create a Yjs update that sets the full text content
 fn create_yjs_text_update(content: &str) -> String {
     let doc = Doc::with_client_id(1);
@@ -467,6 +470,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Route to appropriate mode
     if let Some(directory) = args.directory {
+        // Always ignore the schema file (.commonplace.json) when scanning
+        let mut ignore_patterns = args.ignore;
+        ignore_patterns.push(SCHEMA_FILENAME.to_string());
+
         run_directory_mode(
             client,
             args.server,
@@ -474,7 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             directory,
             ScanOptions {
                 include_hidden: args.include_hidden,
-                ignore_patterns: args.ignore,
+                ignore_patterns,
             },
             args.initial_sync,
             args.use_paths,
@@ -605,6 +612,17 @@ fn spawn_file_sync_tasks(
     ]
 }
 
+/// Write the schema JSON to the local .commonplace.json file
+async fn write_schema_file(
+    directory: &std::path::Path,
+    schema_json: &str,
+) -> Result<(), std::io::Error> {
+    let schema_path = directory.join(SCHEMA_FILENAME);
+    tokio::fs::write(&schema_path, schema_json).await?;
+    info!("Wrote schema to {}", schema_path.display());
+    Ok(())
+}
+
 /// Run directory sync mode
 async fn run_directory_mode(
     client: Client,
@@ -706,11 +724,28 @@ async fn run_directory_mode(
         info!("Pushing filesystem schema to server...");
         push_schema_to_server(&client, &server, &fs_root_id, &schema_json).await?;
         info!("Schema pushed successfully");
+
+        // Write the schema to local .commonplace.json file
+        if let Err(e) = write_schema_file(&directory, &schema_json).await {
+            warn!("Failed to write schema file: {}", e);
+        }
     } else {
         info!(
             "Server already has content, skipping schema push (strategy={})",
             initial_sync_strategy
         );
+
+        // Fetch and write the server's schema to local .commonplace.json file
+        let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
+        if let Ok(resp) = client.get(&head_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(head) = resp.json::<HeadResponse>().await {
+                    if let Err(e) = write_schema_file(&directory, &head.content).await {
+                        warn!("Failed to write schema file: {}", e);
+                    }
+                }
+            }
+        }
     }
 
     // Scan files with contents and push each one
@@ -1551,6 +1586,11 @@ async fn handle_schema_change(
     let head: HeadResponse = resp.json().await?;
     if head.content.is_empty() {
         return Ok(());
+    }
+
+    // Write the schema to local .commonplace.json file
+    if let Err(e) = write_schema_file(directory, &head.content).await {
+        warn!("Failed to write schema file: {}", e);
     }
 
     // Parse schema
