@@ -1739,9 +1739,26 @@ async fn upload_task(
                         "Pending write timed out (id={}), clearing barrier",
                         pending.write_id
                     );
-                    // Update last_written to current content so we don't re-upload
-                    s.last_written_content = content.clone();
-                    // Fall through to normal processing
+                    // The pending write timed out - we don't know if the file contains
+                    // the server content (write succeeded but watcher was slow) or
+                    // stale content (write failed or was interrupted).
+                    //
+                    // If content matches the pending write, treat as delayed echo.
+                    // Otherwise, upload with old parent_cid for CRDT merge.
+                    if content == pending.content {
+                        debug!(
+                            "Timed-out pending matches current content, treating as delayed echo"
+                        );
+                        s.last_written_cid = pending.cid;
+                        s.last_written_content = pending.content;
+                        continue; // Skip upload - it's the server's content
+                    }
+                    // Content differs - this is a user edit that slipped through,
+                    // or the write failed. Upload with old parent for merge.
+                    debug!(
+                        "Timed-out pending differs from current content, uploading as user edit"
+                    );
+                    // DON'T update last_written_* - use old parent for CRDT merge
                 } else if content == pending.content {
                     // Content matches what we wrote - this is our echo
                     debug!(
