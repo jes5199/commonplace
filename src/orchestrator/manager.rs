@@ -136,10 +136,32 @@ impl ProcessManager {
     pub async fn start_all(&mut self) -> Result<(), String> {
         let order = self.config.startup_order()?;
 
+        // Track effectively disabled processes (explicitly disabled + those with disabled deps)
+        let mut effectively_disabled: Vec<String> = self.disabled.clone();
+
         for name in order {
             if self.disabled.contains(&name) {
+                tracing::info!("[orchestrator] Skipping disabled process: {}", name);
                 continue;
             }
+
+            // Check if any dependency is disabled
+            if let Some(proc_config) = self.config.processes.get(&name) {
+                let has_disabled_dep = proc_config
+                    .depends_on
+                    .iter()
+                    .any(|dep| effectively_disabled.contains(dep));
+
+                if has_disabled_dep {
+                    tracing::warn!(
+                        "[orchestrator] Skipping '{}' because a dependency is disabled",
+                        name
+                    );
+                    effectively_disabled.push(name.clone());
+                    continue;
+                }
+            }
+
             self.spawn_process(&name).await?;
             // Small delay to let process initialize
             tokio::time::sleep(Duration::from_millis(100)).await;
