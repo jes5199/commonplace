@@ -36,10 +36,22 @@ async fn main() {
     let broker = args.mqtt_broker.as_ref().unwrap_or(&config.mqtt_broker);
 
     tracing::info!("[orchestrator] Checking MQTT broker at {}", broker);
-    match TcpStream::connect_timeout(
-        &broker.parse().expect("Invalid broker address"),
-        Duration::from_secs(5),
-    ) {
+    // Use ToSocketAddrs to resolve hostname (e.g., "localhost:1883")
+    use std::net::ToSocketAddrs;
+    let addr = match broker.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => {
+                tracing::error!("[orchestrator] No addresses found for broker: {}", broker);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            tracing::error!("[orchestrator] Invalid broker address '{}': {}", broker, e);
+            std::process::exit(1);
+        }
+    };
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(_) => {
             tracing::info!("[orchestrator] MQTT broker is reachable");
         }
