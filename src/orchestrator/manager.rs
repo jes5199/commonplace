@@ -370,8 +370,7 @@ impl ProcessManager {
                         }
                     }
 
-                    let timeout =
-                        tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
 
                     match timeout {
                         Ok(Ok(_)) => {

@@ -115,7 +115,13 @@ impl OrchestratorConfig {
         keys.sort();
 
         for name in keys {
-            visit(name, &self.processes, &mut visited, &mut visiting, &mut order)?;
+            visit(
+                name,
+                &self.processes,
+                &mut visited,
+                &mut visiting,
+                &mut order,
+            )?;
         }
 
         Ok(order)
@@ -139,7 +145,10 @@ mod tests {
         assert_eq!(config.mqtt_broker, "localhost:1883");
         assert_eq!(config.processes.len(), 1);
         assert_eq!(config.processes["store"].command, "commonplace-store");
-        assert_eq!(config.processes["store"].restart.policy, RestartMode::Always);
+        assert_eq!(
+            config.processes["store"].restart.policy,
+            RestartMode::Always
+        );
     }
 
     #[test]
@@ -161,7 +170,10 @@ mod tests {
         }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.mqtt_broker, "localhost:1884");
-        assert_eq!(config.processes["store"].restart.policy, RestartMode::OnFailure);
+        assert_eq!(
+            config.processes["store"].restart.policy,
+            RestartMode::OnFailure
+        );
         assert_eq!(config.processes["store"].restart.backoff_ms, 1000);
         assert_eq!(config.processes["http"].depends_on, vec!["store"]);
     }
