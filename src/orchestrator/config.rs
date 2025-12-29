@@ -70,6 +70,56 @@ impl OrchestratorConfig {
         let config: Self = serde_json::from_str(&content)?;
         Ok(config)
     }
+
+    /// Returns process names in dependency order (dependencies first)
+    pub fn startup_order(&self) -> Result<Vec<String>, String> {
+        let mut order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut visiting = std::collections::HashSet::new();
+
+        fn visit(
+            name: &str,
+            processes: &HashMap<String, ProcessConfig>,
+            visited: &mut std::collections::HashSet<String>,
+            visiting: &mut std::collections::HashSet<String>,
+            order: &mut Vec<String>,
+        ) -> Result<(), String> {
+            if visited.contains(name) {
+                return Ok(());
+            }
+            if visiting.contains(name) {
+                return Err(format!("Dependency cycle detected involving '{}'", name));
+            }
+            visiting.insert(name.to_string());
+
+            if let Some(config) = processes.get(name) {
+                for dep in &config.depends_on {
+                    if !processes.contains_key(dep) {
+                        return Err(format!(
+                            "Unknown dependency '{}' for process '{}'",
+                            dep, name
+                        ));
+                    }
+                    visit(dep, processes, visited, visiting, order)?;
+                }
+            }
+
+            visiting.remove(name);
+            visited.insert(name.to_string());
+            order.push(name.to_string());
+            Ok(())
+        }
+
+        // Sort keys for deterministic ordering
+        let mut keys: Vec<_> = self.processes.keys().collect();
+        keys.sort();
+
+        for name in keys {
+            visit(name, &self.processes, &mut visited, &mut visiting, &mut order)?;
+        }
+
+        Ok(order)
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +164,31 @@ mod tests {
         assert_eq!(config.processes["store"].restart.policy, RestartMode::OnFailure);
         assert_eq!(config.processes["store"].restart.backoff_ms, 1000);
         assert_eq!(config.processes["http"].depends_on, vec!["store"]);
+    }
+
+    #[test]
+    fn test_dependency_order() {
+        let json = r#"{
+            "processes": {
+                "http": { "command": "http", "depends_on": ["store"] },
+                "store": { "command": "store", "depends_on": ["broker"] },
+                "broker": { "command": "broker" }
+            }
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        let order = config.startup_order().unwrap();
+        assert_eq!(order, vec!["broker", "store", "http"]);
+    }
+
+    #[test]
+    fn test_dependency_cycle_detected() {
+        let json = r#"{
+            "processes": {
+                "a": { "command": "a", "depends_on": ["b"] },
+                "b": { "command": "b", "depends_on": ["a"] }
+            }
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert!(config.startup_order().is_err());
     }
 }
