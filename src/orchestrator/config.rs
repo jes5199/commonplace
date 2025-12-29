@@ -71,3 +71,48 @@ impl OrchestratorConfig {
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let json = r#"{
+            "processes": {
+                "store": {
+                    "command": "commonplace-store"
+                }
+            }
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mqtt_broker, "localhost:1883");
+        assert_eq!(config.processes.len(), 1);
+        assert_eq!(config.processes["store"].command, "commonplace-store");
+        assert_eq!(config.processes["store"].restart.policy, RestartMode::Always);
+    }
+
+    #[test]
+    fn test_parse_full_config() {
+        let json = r#"{
+            "mqtt_broker": "localhost:1884",
+            "processes": {
+                "store": {
+                    "command": "commonplace-store",
+                    "args": ["--database", "./data.redb"],
+                    "restart": { "policy": "on_failure", "backoff_ms": 1000, "max_backoff_ms": 30000 }
+                },
+                "http": {
+                    "command": "commonplace-http",
+                    "args": ["--port", "3000"],
+                    "depends_on": ["store"]
+                }
+            }
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mqtt_broker, "localhost:1884");
+        assert_eq!(config.processes["store"].restart.policy, RestartMode::OnFailure);
+        assert_eq!(config.processes["store"].restart.backoff_ms, 1000);
+        assert_eq!(config.processes["http"].depends_on, vec!["store"]);
+    }
+}
