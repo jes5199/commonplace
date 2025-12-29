@@ -33,7 +33,13 @@ async fn main() {
         }
     };
 
-    let broker = args.mqtt_broker.as_ref().unwrap_or(&config.mqtt_broker);
+    let broker_raw = args.mqtt_broker.as_ref().unwrap_or(&config.mqtt_broker);
+
+    // Strip mqtt:// or tcp:// scheme if present (ToSocketAddrs only handles host:port)
+    let broker = broker_raw
+        .strip_prefix("mqtt://")
+        .or_else(|| broker_raw.strip_prefix("tcp://"))
+        .unwrap_or(broker_raw);
 
     tracing::info!("[orchestrator] Checking MQTT broker at {}", broker);
     // Use ToSocketAddrs to resolve hostname (e.g., "localhost:1883")
@@ -76,12 +82,28 @@ async fn main() {
             tracing::error!("[orchestrator] Failed to start '{}': {}", only, e);
             std::process::exit(1);
         }
-        // Wait for the single process
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                tracing::info!("[orchestrator] Received Ctrl+C");
+
+        // Create shutdown signal for --only mode
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("[orchestrator] Received Ctrl+C");
+            let _ = shutdown_tx.send(());
+        });
+
+        // Monitor the single process with restart support
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    manager.check_and_restart().await;
+                }
             }
         }
+
         manager.shutdown().await;
     } else {
         // Start all processes
