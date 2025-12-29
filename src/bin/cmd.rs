@@ -50,8 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(Duration::from_secs(2), client_clone.run_event_loop()).await;
     });
 
-    // Give the connection a moment to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Give the connection time to establish (500ms is generous for localhost)
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish the command
     let payload_bytes = serde_json::to_vec(&message)?;
@@ -61,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Sent {} to {}", args.verb, args.path);
 
-    // Give the message time to be sent
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for PUBACK confirmation (500ms for QoS1 delivery)
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Cancel the event loop
     loop_handle.abort();
