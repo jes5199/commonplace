@@ -1858,6 +1858,12 @@ async fn upload_task(
                         s.pending_write = None; // Clear barrier
                                                 // DON'T update last_written_* - use old parent for CRDT merge
                                                 // Fall through to upload with old parent_cid
+
+                        // IMPORTANT: Also check needs_head_refresh here!
+                        // If server edits were skipped while barrier was up, we need to
+                        // refresh after uploading to get the merged state.
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
                     }
                 }
             } else {
@@ -1981,6 +1987,11 @@ async fn upload_task(
                     }
                 }
             }
+        }
+
+        // After upload, refresh from HEAD if server edits were skipped
+        if should_refresh {
+            refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
         }
     }
 }
