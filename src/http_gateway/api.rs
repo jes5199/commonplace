@@ -1,4 +1,15 @@
 //! HTTP Gateway API routes - translates HTTP to MQTT
+//!
+//! ## Node ID Encoding
+//!
+//! Node IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
+//! HTTP requests, these must be URL-encoded. For example:
+//!
+//! - Node ID: `foo/bar/file.txt`
+//! - HTTP path: `/nodes/foo%2Fbar%2Ffile.txt/edit`
+//!
+//! Axum automatically URL-decodes the path parameter, so the handler receives
+//! the original node ID.
 
 use axum::{
     extract::{Path, State},

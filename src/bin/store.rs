@@ -8,7 +8,7 @@ use commonplace_doc::{
     cli::StoreArgs,
     document::ContentType,
     fs::FilesystemReconciler,
-    mqtt::{MqttConfig, MqttService},
+    mqtt::{topics::validate_extension, MqttConfig, MqttService},
     node::{NodeId, NodeRegistry, ObservableNode},
     router::RouterManager,
     store::CommitStore,
@@ -32,6 +32,26 @@ async fn main() {
 
     tracing::info!("Starting commonplace-store");
 
+    // Validate that fs-root and router paths have valid extensions
+    // (required for MQTT topic parsing to work)
+    if let Err(e) = validate_extension(&args.fs_root) {
+        tracing::error!(
+            "Invalid fs-root path '{}': {}. Paths must have extensions like .json, .txt, etc.",
+            args.fs_root, e
+        );
+        std::process::exit(1);
+    }
+
+    for router_path in &args.routers {
+        if let Err(e) = validate_extension(router_path) {
+            tracing::error!(
+                "Invalid router path '{}': {}. Paths must have extensions like .json, .txt, etc.",
+                router_path, e
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Create commit store (required for store binary)
     tracing::info!("Using database at: {}", args.database.display());
     let commit_store =
@@ -44,18 +64,18 @@ async fn main() {
     let fs_root_id = NodeId::new(&args.fs_root);
     tracing::info!("Filesystem root: {}", args.fs_root);
 
-    // Get or create the fs-root document node
+    // Get or create the fs-root document node (required)
     let fs_node = match node_registry
         .get_or_create_document(&fs_root_id, ContentType::Text)
         .await
     {
         Ok(node) => {
             tracing::info!("Filesystem root initialized at node: {}", args.fs_root);
-            Some(node)
+            node
         }
         Err(e) => {
             tracing::error!("Failed to create fs-root node: {}", e);
-            None
+            std::process::exit(1);
         }
     };
 
@@ -69,20 +89,18 @@ async fn main() {
     reconciler.clone().start().await;
 
     // Perform initial reconciliation
-    if let Some(ref fs_node) = fs_node {
-        if let Some(observable) = fs_node
-            .as_any()
-            .downcast_ref::<commonplace_doc::node::DocumentNode>()
-        {
-            match observable.get_content().await {
-                Ok(content) if !content.is_empty() && content != "{}" => {
-                    if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
-                        tracing::warn!("Initial fs reconcile failed: {}", e);
-                        reconciler.emit_error(e, None).await;
-                    }
+    if let Some(observable) = fs_node
+        .as_any()
+        .downcast_ref::<commonplace_doc::node::DocumentNode>()
+    {
+        match observable.get_content().await {
+            Ok(content) if !content.is_empty() && content != "{}" => {
+                if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
+                    tracing::warn!("Initial fs reconcile failed: {}", e);
+                    reconciler.emit_error(e, None).await;
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -154,15 +172,13 @@ async fn main() {
 
     // Subscribe to paths based on fs-root content
     // Parse the fs-root JSON to get document paths
-    if let Some(ref fs_node) = fs_node {
-        if let Some(observable) = fs_node
-            .as_any()
-            .downcast_ref::<commonplace_doc::node::DocumentNode>()
-        {
-            if let Ok(content) = observable.get_content().await {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    subscribe_to_paths(&mqtt_service, &json, "").await;
-                }
+    if let Some(observable) = fs_node
+        .as_any()
+        .downcast_ref::<commonplace_doc::node::DocumentNode>()
+    {
+        if let Ok(content) = observable.get_content().await {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                subscribe_to_paths(&mqtt_service, &json, "").await;
             }
         }
     }

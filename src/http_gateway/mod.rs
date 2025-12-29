@@ -54,14 +54,16 @@ impl HttpGateway {
     pub(crate) async fn add_subscriber(&self, topic: &str) -> Result<(), MqttError> {
         let mut counts = self.subscription_counts.write().await;
         let count = counts.entry(topic.to_string()).or_insert(0);
-        *count += 1;
 
-        if *count == 1 {
+        if *count == 0 {
             // First subscriber - actually subscribe to MQTT
+            // Subscribe before incrementing count so failures don't leave stale counts
             self.client.subscribe(topic, QoS::AtLeastOnce).await?;
             tracing::debug!("SSE subscribed to MQTT topic: {}", topic);
         }
 
+        // Only increment after successful subscribe
+        *count += 1;
         Ok(())
     }
 

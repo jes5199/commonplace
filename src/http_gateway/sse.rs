@@ -1,4 +1,14 @@
 //! HTTP Gateway SSE routes - bridges MQTT to Server-Sent Events
+//!
+//! ## Node ID Encoding
+//!
+//! Node IDs may contain path separators (e.g., `foo/bar/file.txt`). When making
+//! HTTP requests, these must be URL-encoded:
+//!
+//! - Node ID: `foo/bar/file.txt`
+//! - SSE endpoint: `/sse/nodes/foo%2Fbar%2Ffile.txt`
+//!
+//! Axum automatically URL-decodes the path parameter.
 
 use axum::{
     extract::{Path, State},

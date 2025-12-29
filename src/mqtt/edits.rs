@@ -88,9 +88,25 @@ impl EditsHandler {
             topic.path, edit_msg.author
         );
 
+        // Determine parents: use provided parents, or infer from current HEAD if empty
+        let parents = if edit_msg.parents.is_empty() {
+            // No parents provided - infer from current document HEAD
+            if let Some(store) = &self.commit_store {
+                if let Ok(Some(head)) = store.get_document_head(&topic.path).await {
+                    vec![head]
+                } else {
+                    vec![] // No HEAD yet, this is a root commit
+                }
+            } else {
+                vec![] // No commit store, use empty parents
+            }
+        } else {
+            edit_msg.parents.clone()
+        };
+
         // Create commit from the edit message
         let commit = Commit {
-            parents: edit_msg.parents.clone(),
+            parents,
             timestamp: edit_msg.timestamp,
             update: edit_msg.update.clone(),
             author: edit_msg.author.clone(),
