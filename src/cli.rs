@@ -101,3 +101,27 @@ pub struct OrchestratorArgs {
     #[clap(long, value_name = "NAME")]
     pub only: Option<String>,
 }
+
+/// CLI arguments for commonplace-cmd (send commands to paths)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-cmd")]
+#[clap(about = "Send commands to commonplace document paths via MQTT", long_about = None)]
+pub struct CmdArgs {
+    /// Document path (e.g., "examples/counter.json")
+    pub path: String,
+
+    /// Command verb (e.g., "increment", "reset")
+    pub verb: String,
+
+    /// JSON payload (optional, defaults to {})
+    #[clap(short, long, default_value = "{}")]
+    pub payload: String,
+
+    /// MQTT broker URL
+    #[clap(long, default_value = "mqtt://localhost:1883")]
+    pub mqtt_broker: String,
+
+    /// Source identifier for the command
+    #[clap(long, default_value = "commonplace-cmd")]
+    pub source: String,
+}

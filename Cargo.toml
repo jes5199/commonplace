@@ -27,6 +27,10 @@ path = "src/bin/sync.rs"
 name = "commonplace-orchestrator"
 path = "src/bin/orchestrator.rs"
 
+[[bin]]
+name = "commonplace-cmd"
+path = "src/bin/cmd.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
