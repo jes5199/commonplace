@@ -2011,8 +2011,14 @@ async fn upload_task(
         // After successful upload, refresh from HEAD if server edits were skipped
         // IMPORTANT: Only refresh after successful upload to avoid overwriting
         // local edits when upload fails
-        if should_refresh && upload_succeeded {
-            refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+        if should_refresh {
+            if upload_succeeded {
+                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+            } else {
+                // Upload failed - re-set the flag so we try again next time
+                let mut s = state.write().await;
+                s.needs_head_refresh = true;
+            }
         }
     }
 }
@@ -2153,12 +2159,12 @@ async fn refresh_from_head(
         match STANDARD.decode(&head.content) {
             Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
             Err(e) => {
-                error!("Failed to decode base64 content for refresh: {}", e);
-                // Revert state on failure
-                let mut s = state.write().await;
-                s.last_written_cid = None;
-                s.last_written_content = String::new();
-                return;
+                // Decode failed - fall back to writing as text (like initial sync does)
+                warn!(
+                    "Failed to decode base64 content for refresh, writing as text: {}",
+                    e
+                );
+                tokio::fs::write(file_path, &head.content).await
             }
         }
     } else {
