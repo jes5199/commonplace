@@ -110,6 +110,9 @@ struct SyncState {
     current_write_id: u64,
     /// Currently pending server write (barrier is "up" when Some)
     pending_write: Option<PendingWrite>,
+    /// Flag indicating a server edit was skipped while barrier was up
+    /// upload_task should refresh HEAD after clearing barrier if this is true
+    needs_head_refresh: bool,
 }
 
 impl SyncState {
@@ -119,6 +122,7 @@ impl SyncState {
             last_written_content: String::new(),
             current_write_id: 0,
             pending_write: None,
+            needs_head_refresh: false,
         }
     }
 }
@@ -1502,6 +1506,7 @@ async fn handle_schema_change(
                             last_written_content: file_head.content,
                             current_write_id: 0,
                             pending_write: None,
+                            needs_head_refresh: false,
                         }));
 
                         info!("Created local file: {}", file_path.display());
@@ -1728,6 +1733,10 @@ async fn upload_task(
         };
 
         // Check for pending write barrier and handle echo detection
+        // Track whether we detected an echo and need to refresh from HEAD
+        let mut echo_detected = false;
+        let mut should_refresh = false;
+
         {
             let mut s = state.write().await;
 
@@ -1751,14 +1760,17 @@ async fn upload_task(
                         );
                         s.last_written_cid = pending.cid;
                         s.last_written_content = pending.content;
-                        continue; // Skip upload - it's the server's content
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        // Content differs - this is a user edit that slipped through,
+                        // or the write failed. Upload with old parent for merge.
+                        debug!(
+                            "Timed-out pending differs from current content, uploading as user edit"
+                        );
+                        // DON'T update last_written_* - use old parent for CRDT merge
                     }
-                    // Content differs - this is a user edit that slipped through,
-                    // or the write failed. Upload with old parent for merge.
-                    debug!(
-                        "Timed-out pending differs from current content, uploading as user edit"
-                    );
-                    // DON'T update last_written_* - use old parent for CRDT merge
                 } else if content == pending.content {
                     // Content matches what we wrote - this is our echo
                     debug!(
@@ -1768,7 +1780,9 @@ async fn upload_task(
                     s.last_written_cid = pending.cid;
                     s.last_written_content = pending.content;
                     // Barrier cleared (we took it with .take())
-                    continue; // Skip upload
+                    should_refresh = s.needs_head_refresh;
+                    s.needs_head_refresh = false;
+                    echo_detected = true;
                 } else {
                     // Content differs from pending - could be:
                     // a) Partial write (we're mid-write or just finished)
@@ -1830,27 +1844,38 @@ async fn upload_task(
                         // Our write completed after retries
                         debug!("Echo confirmed after retries (id={})", pending_write_id);
                         s.last_written_cid = pending_cid;
-                        s.last_written_content = content;
+                        s.last_written_content = content.clone();
                         s.pending_write = None;
-                        continue; // Skip upload
+                        should_refresh = s.needs_head_refresh;
+                        s.needs_head_refresh = false;
+                        echo_detected = true;
+                    } else {
+                        // User edited during our write
+                        info!(
+                            "User edit detected during server write (id={})",
+                            pending_write_id
+                        );
+                        s.pending_write = None; // Clear barrier
+                                                // DON'T update last_written_* - use old parent for CRDT merge
+                                                // Fall through to upload with old parent_cid
                     }
-
-                    // User edited during our write
-                    info!(
-                        "User edit detected during server write (id={})",
-                        pending_write_id
-                    );
-                    s.pending_write = None; // Clear barrier
-                                            // DON'T update last_written_* - use old parent for CRDT merge
-                                            // Fall through to upload with old parent_cid
                 }
             } else {
                 // No barrier - normal echo detection
                 if content == s.last_written_content {
                     debug!("Ignoring echo: content matches last written");
-                    continue;
+                    // No barrier means no needs_head_refresh to check
+                    echo_detected = true;
                 }
             }
+        }
+
+        // If echo detected, optionally refresh from HEAD then skip upload
+        if echo_detected {
+            if should_refresh {
+                refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
+            }
+            continue;
         }
 
         if is_json {
@@ -2037,6 +2062,88 @@ async fn sse_task(
 /// Timeout for pending write barrier (30 seconds)
 const PENDING_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Refresh local file from server HEAD if needed
+/// Called by upload_task after clearing barrier when needs_head_refresh was set
+async fn refresh_from_head(
+    client: &Client,
+    server: &str,
+    node_id: &str,
+    file_path: &PathBuf,
+    state: &Arc<RwLock<SyncState>>,
+) {
+    debug!("Refreshing from HEAD due to skipped server edit");
+
+    // Fetch HEAD
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(node_id));
+    let resp = match client.get(&head_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to fetch HEAD for refresh: {}", e);
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        error!("HEAD fetch failed for refresh: {}", resp.status());
+        return;
+    }
+
+    let head: HeadResponse = match resp.json().await {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Failed to parse HEAD response for refresh: {}", e);
+            return;
+        }
+    };
+
+    // Check if content differs from what we have
+    {
+        let s = state.read().await;
+        if head.content == s.last_written_content {
+            debug!("HEAD matches last_written_content, no refresh needed");
+            return;
+        }
+    }
+
+    // Content differs - we need to write the new content
+    // Use similar logic to handle_server_edit for binary detection
+    let content_info = detect_from_path(file_path);
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let write_result = if content_info.is_binary {
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
+            Err(e) => {
+                error!("Failed to decode base64 content for refresh: {}", e);
+                return;
+            }
+        }
+    } else {
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                tokio::fs::write(file_path, &decoded).await
+            }
+            _ => tokio::fs::write(file_path, &head.content).await,
+        }
+    };
+
+    if let Err(e) = write_result {
+        error!("Failed to write file for refresh: {}", e);
+        return;
+    }
+
+    // Update state
+    {
+        let mut s = state.write().await;
+        s.last_written_cid = head.cid.clone();
+        s.last_written_content = head.content.clone();
+    }
+
+    info!(
+        "Refreshed local file from HEAD: {} bytes",
+        head.content.len()
+    );
+}
+
 /// Handle a server edit event
 async fn handle_server_edit(
     client: &Client,
@@ -2079,12 +2186,15 @@ async fn handle_server_edit(
         // Check if there's already a pending write (concurrent SSE events)
         if let Some(pending) = &s.pending_write {
             if pending.started_at.elapsed() < PENDING_WRITE_TIMEOUT {
-                // Another write in progress, skip this one
-                // The SSE will fire again if needed, or upload_task will handle it
+                // Another write in progress, we can't process this SSE event now.
+                // Set a flag so upload_task knows to refresh HEAD after clearing barrier.
+                // This prevents data loss when multiple server edits arrive quickly.
                 debug!(
-                    "Skipping server edit - another write in progress (id={})",
+                    "Skipping server edit - another write in progress (id={}), \
+                     setting needs_head_refresh flag",
                     pending.write_id
                 );
+                s.needs_head_refresh = true;
                 return;
             }
             // Timeout - clear stale pending and continue
