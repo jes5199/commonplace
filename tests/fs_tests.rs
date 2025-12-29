@@ -2,28 +2,25 @@
 
 use commonplace_doc::{
     create_router_with_config,
-    document::ContentType,
+    document::{ContentType, DocumentStore},
     fs::FilesystemReconciler,
-    node::{NodeId, NodeRegistry},
     RouterConfig,
 };
 use std::sync::Arc;
 
-/// Test that reconciler creates nodes from filesystem JSON.
+/// Test that reconciler creates documents from filesystem JSON.
 #[tokio::test]
-async fn test_reconciler_creates_nodes() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+async fn test_reconciler_creates_documents() {
+    let store = Arc::new(DocumentStore::new());
 
-    // Create fs-root node
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    // Create fs-root document
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     // Reconcile with a simple filesystem
@@ -40,34 +37,29 @@ async fn test_reconciler_creates_nodes() {
 
     reconciler.reconcile(content).await.unwrap();
 
-    // Verify nodes were created with derived IDs
-    let notes_id = NodeId::new("test-fs:notes.txt");
-    let data_id = NodeId::new("test-fs:data.json");
-
+    // Verify documents were created with derived IDs
     assert!(
-        registry.get(&notes_id).await.is_some(),
-        "notes.txt node should exist"
+        store.get_document("test-fs:notes.txt").await.is_some(),
+        "notes.txt document should exist"
     );
     assert!(
-        registry.get(&data_id).await.is_some(),
-        "data.json node should exist"
+        store.get_document("test-fs:data.json").await.is_some(),
+        "data.json document should exist"
     );
 }
 
 /// Test that explicit node_id is used instead of derived ID.
 #[tokio::test]
 async fn test_reconciler_uses_explicit_node_id() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     let content = r#"{
@@ -86,36 +78,31 @@ async fn test_reconciler_uses_explicit_node_id() {
     reconciler.reconcile(content).await.unwrap();
 
     // Verify explicit ID was used
-    let explicit_id = NodeId::new("my-stable-id");
-    let derived_id = NodeId::new("test-fs:stable.txt");
-
     assert!(
-        registry.get(&explicit_id).await.is_some(),
+        store.get_document("my-stable-id").await.is_some(),
         "explicit node ID should exist"
     );
     assert!(
-        registry.get(&derived_id).await.is_none(),
+        store.get_document("test-fs:stable.txt").await.is_none(),
         "derived ID should NOT exist"
     );
 }
 
-/// Test that removing entry from JSON doesn't delete the node.
+/// Test that removing entry from JSON doesn't delete the document.
 #[tokio::test]
 async fn test_reconciler_non_destructive() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
-    // First, create a node
+    // First, create a document
     let content1 = r#"{
         "version": 1,
         "root": {
@@ -128,8 +115,7 @@ async fn test_reconciler_non_destructive() {
 
     reconciler.reconcile(content1).await.unwrap();
 
-    let file_id = NodeId::new("test-fs:file.txt");
-    assert!(registry.get(&file_id).await.is_some());
+    assert!(store.get_document("test-fs:file.txt").await.is_some());
 
     // Remove entry from JSON
     let content2 = r#"{
@@ -142,27 +128,25 @@ async fn test_reconciler_non_destructive() {
 
     reconciler.reconcile(content2).await.unwrap();
 
-    // Node should still exist (non-destructive)
+    // Document should still exist (non-destructive)
     assert!(
-        registry.get(&file_id).await.is_some(),
-        "node should NOT be deleted"
+        store.get_document("test-fs:file.txt").await.is_some(),
+        "document should NOT be deleted"
     );
 }
 
 /// Test that invalid JSON triggers error.
 #[tokio::test]
 async fn test_reconciler_handles_invalid_json() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     let result = reconciler.reconcile("not valid json").await;
@@ -172,17 +156,15 @@ async fn test_reconciler_handles_invalid_json() {
 /// Test that invalid entry names are rejected.
 #[tokio::test]
 async fn test_reconciler_rejects_invalid_names() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     // Entry with slash in name
@@ -203,17 +185,15 @@ async fn test_reconciler_rejects_invalid_names() {
 /// Test that unsupported version is rejected.
 #[tokio::test]
 async fn test_reconciler_rejects_unsupported_version() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     let content = r#"{"version": 99}"#;
@@ -225,17 +205,15 @@ async fn test_reconciler_rejects_unsupported_version() {
 /// Test that non-directory root is rejected.
 #[tokio::test]
 async fn test_reconciler_rejects_non_directory_root() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     // Root is a doc instead of a dir
@@ -251,17 +229,15 @@ async fn test_reconciler_rejects_non_directory_root() {
 /// Test nested directories.
 #[tokio::test]
 async fn test_reconciler_nested_dirs() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     let content = r#"{
@@ -286,27 +262,27 @@ async fn test_reconciler_nested_dirs() {
 
     reconciler.reconcile(content).await.unwrap();
 
-    let deep_id = NodeId::new("test-fs:level1/level2/deep.txt");
     assert!(
-        registry.get(&deep_id).await.is_some(),
-        "deeply nested node should exist"
+        store
+            .get_document("test-fs:level1/level2/deep.txt")
+            .await
+            .is_some(),
+        "deeply nested document should exist"
     );
 }
 
-/// Test that nodes are recreated if deleted externally.
+/// Test that documents are recreated if deleted externally.
 #[tokio::test]
-async fn test_reconciler_recreates_deleted_nodes() {
-    let registry = Arc::new(NodeRegistry::new());
-    let fs_root_id = NodeId::new("test-fs");
+async fn test_reconciler_recreates_deleted_documents() {
+    let store = Arc::new(DocumentStore::new());
 
-    registry
-        .get_or_create_document(&fs_root_id, ContentType::Json)
-        .await
-        .unwrap();
+    store
+        .get_or_create_with_id("test-fs", ContentType::Json)
+        .await;
 
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        registry.clone(),
+        "test-fs".to_string(),
+        store.clone(),
     ));
 
     let content = r#"{
@@ -319,24 +295,23 @@ async fn test_reconciler_recreates_deleted_nodes() {
         }
     }"#;
 
-    // First reconcile creates the node
+    // First reconcile creates the document
     reconciler.reconcile(content).await.unwrap();
 
-    let file_id = NodeId::new("test-fs:file.txt");
-    assert!(registry.get(&file_id).await.is_some());
+    assert!(store.get_document("test-fs:file.txt").await.is_some());
 
-    // Delete the node externally (simulating DELETE /nodes/:id)
-    registry.unregister(&file_id).await.ok();
+    // Delete the document externally (simulating DELETE /docs/:id)
+    store.delete_document("test-fs:file.txt").await;
     assert!(
-        registry.get(&file_id).await.is_none(),
-        "node should be deleted"
+        store.get_document("test-fs:file.txt").await.is_none(),
+        "document should be deleted"
     );
 
-    // Re-reconcile should recreate the node
+    // Re-reconcile should recreate the document
     reconciler.reconcile(content).await.unwrap();
     assert!(
-        registry.get(&file_id).await.is_some(),
-        "node should be recreated after external deletion"
+        store.get_document("test-fs:file.txt").await.is_some(),
+        "document should be recreated after external deletion"
     );
 }
 
@@ -346,7 +321,6 @@ async fn test_router_with_fs_root() {
     let _app = create_router_with_config(RouterConfig {
         commit_store: None,
         fs_root: Some("my-filesystem".to_string()),
-        routers: vec![],
         mqtt: None,
         mqtt_subscribe: vec![],
     })

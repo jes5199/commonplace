@@ -9,7 +9,6 @@ use commonplace_doc::{
     document::{ContentType, DocumentStore},
     fs::FilesystemReconciler,
     mqtt::{topics::validate_extension, MqttConfig, MqttService},
-    node::{NodeId, NodeRegistry, ObservableNode},
     store::CommitStore,
 };
 use std::sync::Arc;
@@ -50,50 +49,27 @@ async fn main() {
     // Create document store
     let doc_store = Arc::new(DocumentStore::new());
 
-    // Create node registry
-    let node_registry = Arc::new(NodeRegistry::new());
-
     // Initialize filesystem root
-    let fs_root_id = NodeId::new(&args.fs_root);
     tracing::info!("Filesystem root: {}", args.fs_root);
 
-    // Get or create the fs-root document node (required)
-    let fs_node = match node_registry
-        .get_or_create_document(&fs_root_id, ContentType::Text)
-        .await
-    {
-        Ok(node) => {
-            tracing::info!("Filesystem root initialized at node: {}", args.fs_root);
-            node
-        }
-        Err(e) => {
-            tracing::error!("Failed to create fs-root node: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Get or create the fs-root document (required)
+    let fs_doc = doc_store
+        .get_or_create_with_id(&args.fs_root, ContentType::Text)
+        .await;
+
+    tracing::info!("Filesystem root initialized at document: {}", args.fs_root);
 
     // Create filesystem reconciler
     let reconciler = Arc::new(FilesystemReconciler::new(
-        fs_root_id.clone(),
-        node_registry.clone(),
+        args.fs_root.clone(),
+        doc_store.clone(),
     ));
 
-    // Start watching for filesystem changes
-    reconciler.clone().start().await;
-
     // Perform initial reconciliation
-    if let Some(observable) = fs_node
-        .as_any()
-        .downcast_ref::<commonplace_doc::node::DocumentNode>()
-    {
-        match observable.get_content().await {
-            Ok(content) if !content.is_empty() && content != "{}" => {
-                if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
-                    tracing::warn!("Initial fs reconcile failed: {}", e);
-                    reconciler.emit_error(e, None).await;
-                }
-            }
-            _ => {}
+    let content = fs_doc.content.clone();
+    if !content.is_empty() && content != "{}" {
+        if let Err(e) = reconciler.reconcile(&content).await {
+            tracing::warn!("Initial fs reconcile failed: {}", e);
         }
     }
 
@@ -139,15 +115,8 @@ async fn main() {
 
     // Subscribe to paths based on fs-root content
     // Parse the fs-root JSON to get document paths
-    if let Some(observable) = fs_node
-        .as_any()
-        .downcast_ref::<commonplace_doc::node::DocumentNode>()
-    {
-        if let Ok(content) = observable.get_content().await {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                subscribe_to_paths(&mqtt_service, &json, "").await;
-            }
-        }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        subscribe_to_paths(&mqtt_service, &json, "").await;
     }
 
     // Run the MQTT event loop (blocks forever)

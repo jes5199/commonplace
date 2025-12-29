@@ -19,7 +19,7 @@ use axum::{routing::get, Router};
 use document::{ContentType, DocumentStore};
 use events::CommitBroadcaster;
 use fs::FilesystemReconciler;
-use node::{NodeId, NodeRegistry, ObservableNode};
+use node::NodeRegistry;
 use std::sync::Arc;
 use store::CommitStore;
 use tower_http::cors::CorsLayer;
@@ -50,42 +50,25 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
 
     // Initialize filesystem if --fs-root is specified
     if let Some(ref fs_root_id) = config.fs_root {
-        let node_id = NodeId::new(fs_root_id);
-
-        // Get or create the fs-root document node
+        // Get or create the fs-root document
         // Use Text type since the edit system uses TEXT-based Yjs updates
-        match node_registry
-            .get_or_create_document(&node_id, ContentType::Text)
-            .await
-        {
-            Ok(fs_node) => {
-                tracing::info!("Filesystem root initialized at node: {}", fs_root_id);
+        let fs_doc = doc_store
+            .get_or_create_with_id(fs_root_id, ContentType::Text)
+            .await;
 
-                // Create and start the reconciler
-                let reconciler = Arc::new(FilesystemReconciler::new(
-                    node_id.clone(),
-                    node_registry.clone(),
-                ));
+        tracing::info!("Filesystem root initialized at document: {}", fs_root_id);
 
-                // Start watching (spawns background task)
-                reconciler.clone().start().await;
+        // Create the reconciler
+        let reconciler = Arc::new(FilesystemReconciler::new(
+            fs_root_id.clone(),
+            doc_store.clone(),
+        ));
 
-                // Perform initial reconciliation with watcher registration
-                if let Some(observable) = fs_node.as_any().downcast_ref::<node::DocumentNode>() {
-                    match observable.get_content().await {
-                        Ok(content) if !content.is_empty() && content != "{}" => {
-                            if let Err(e) = reconciler.reconcile_with_watchers(&content).await {
-                                tracing::warn!("Initial fs reconcile failed: {}", e);
-                                // Emit fs.error event so clients are notified
-                                reconciler.emit_error(e, None).await;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create fs-root node: {}", e);
+        // Perform initial reconciliation
+        let content = fs_doc.content;
+        if !content.is_empty() && content != "{}" {
+            if let Err(e) = reconciler.reconcile(&content).await {
+                tracing::warn!("Initial fs reconcile failed: {}", e);
             }
         }
     }
