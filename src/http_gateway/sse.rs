@@ -7,7 +7,6 @@ use axum::{
     Router,
 };
 use futures::stream::Stream;
-use rumqttc::QoS;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -41,12 +40,8 @@ async fn subscribe_to_node(
 
     // Spawn a task to handle the MQTT subscription and forward messages
     tokio::spawn(async move {
-        // Subscribe to edits
-        if let Err(e) = gateway_clone
-            .client
-            .subscribe(&edits_topic_clone, QoS::AtLeastOnce)
-            .await
-        {
+        // Subscribe to edits using reference-counted subscription
+        if let Err(e) = gateway_clone.add_subscriber(&edits_topic_clone).await {
             tracing::error!("Failed to subscribe to {}: {}", edits_topic_clone, e);
             let _ = tx_clone
                 .send(Ok(Event::default()
@@ -100,9 +95,9 @@ async fn subscribe_to_node(
             }
         }
 
-        // Cleanup: unsubscribe from MQTT topic
-        let _ = gateway_clone.client.unsubscribe(&edits_topic_clone).await;
-        tracing::debug!("SSE client disconnected, unsubscribed from {}", edits_topic_clone);
+        // Cleanup: decrement reference count (only unsubscribes if last subscriber)
+        gateway_clone.remove_subscriber(&edits_topic_clone).await;
+        tracing::debug!("SSE client disconnected from {}", edits_topic_clone);
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())

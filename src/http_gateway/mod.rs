@@ -9,12 +9,17 @@ mod sse;
 pub use api::router;
 
 use crate::mqtt::{client::MqttClient, MqttConfig, MqttError};
+use rumqttc::QoS;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// HTTP Gateway that translates HTTP to MQTT
 pub struct HttpGateway {
     /// MQTT client for publishing and subscribing
     pub(crate) client: Arc<MqttClient>,
+    /// Reference counts for MQTT topic subscriptions (for SSE)
+    pub(crate) subscription_counts: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl HttpGateway {
@@ -33,11 +38,49 @@ impl HttpGateway {
             }
         });
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            subscription_counts: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     /// Get a reference to the MQTT client
     pub fn client(&self) -> &Arc<MqttClient> {
         &self.client
+    }
+
+    /// Increment the subscription count for a topic.
+    /// If this is the first subscriber, actually subscribe to MQTT.
+    pub(crate) async fn add_subscriber(&self, topic: &str) -> Result<(), MqttError> {
+        let mut counts = self.subscription_counts.write().await;
+        let count = counts.entry(topic.to_string()).or_insert(0);
+        *count += 1;
+
+        if *count == 1 {
+            // First subscriber - actually subscribe to MQTT
+            self.client.subscribe(topic, QoS::AtLeastOnce).await?;
+            tracing::debug!("SSE subscribed to MQTT topic: {}", topic);
+        }
+
+        Ok(())
+    }
+
+    /// Decrement the subscription count for a topic.
+    /// If this was the last subscriber, actually unsubscribe from MQTT.
+    pub(crate) async fn remove_subscriber(&self, topic: &str) {
+        let mut counts = self.subscription_counts.write().await;
+        if let Some(count) = counts.get_mut(topic) {
+            *count = count.saturating_sub(1);
+
+            if *count == 0 {
+                counts.remove(topic);
+                // Last subscriber - unsubscribe from MQTT
+                if let Err(e) = self.client.unsubscribe(topic).await {
+                    tracing::warn!("Failed to unsubscribe from {}: {}", topic, e);
+                } else {
+                    tracing::debug!("SSE unsubscribed from MQTT topic: {}", topic);
+                }
+            }
+        }
     }
 }
