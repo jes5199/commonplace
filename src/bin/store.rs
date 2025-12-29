@@ -126,9 +126,11 @@ async fn main() {
     }
 
     // Subscribe to paths based on fs-root content
-    // Parse the fs-root JSON to get document paths
+    // Parse the versioned fs-root schema to get document paths
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-        subscribe_to_paths(&mqtt_service, &json, "").await;
+        if let Some(root) = json.get("root") {
+            subscribe_to_entry(&mqtt_service, root, "").await;
+        }
     }
 
     // Run the MQTT event loop (blocks forever)
@@ -139,37 +141,58 @@ async fn main() {
     }
 }
 
-/// Recursively subscribe to document paths found in the fs-root JSON
-fn subscribe_to_paths<'a>(
+/// Recursively subscribe to document paths found in the versioned fs-root schema.
+///
+/// The schema format is:
+/// ```json
+/// {
+///   "version": 1,
+///   "root": {
+///     "type": "dir",
+///     "entries": {
+///       "notes": { "type": "dir", "entries": { "todo.txt": { "type": "doc" } } },
+///       "readme.txt": { "type": "doc" }
+///     }
+///   }
+/// }
+/// ```
+fn subscribe_to_entry<'a>(
     mqtt: &'a MqttService,
-    value: &'a serde_json::Value,
+    entry: &'a serde_json::Value,
     prefix: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if let serde_json::Value::Object(map) = value {
-            for (key, val) in map {
-                // Skip metadata keys
-                if key.starts_with('_') {
-                    continue;
-                }
+        let entry_type = match entry.get("type").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => return,
+        };
 
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}/{}", prefix, key)
-                };
-
-                // If this key has an extension, it's a document - subscribe
-                if key.contains('.') {
-                    if let Err(e) = mqtt.subscribe_path(&path).await {
-                        tracing::warn!("Failed to subscribe to {}: {}", path, e);
+        match entry_type {
+            "doc" => {
+                // This is a document - subscribe to its path
+                if !prefix.is_empty() {
+                    if let Err(e) = mqtt.subscribe_path(prefix).await {
+                        tracing::warn!("Failed to subscribe to {}: {}", prefix, e);
                     } else {
-                        tracing::info!("Subscribed to path: {}", path);
+                        tracing::info!("Subscribed to path: {}", prefix);
                     }
-                } else {
-                    // It's a directory, recurse
-                    subscribe_to_paths(mqtt, val, &path).await;
                 }
+            }
+            "dir" => {
+                // This is a directory - recurse into entries
+                if let Some(serde_json::Value::Object(map)) = entry.get("entries") {
+                    for (name, child) in map {
+                        let path = if prefix.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", prefix, name)
+                        };
+                        subscribe_to_entry(mqtt, child, &path).await;
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("Unknown entry type: {}", entry_type);
             }
         }
     })

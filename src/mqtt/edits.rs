@@ -109,6 +109,7 @@ impl EditsHandler {
         // Check if this is an fs-root edit (special case: path IS the document ID)
         let fs_root_path = self.fs_root_path.read().await;
         let is_fs_root_edit = fs_root_path.as_ref() == Some(&topic.path);
+        let fs_root_id = fs_root_path.clone();
         drop(fs_root_path);
 
         // Resolve path to document ID:
@@ -118,9 +119,14 @@ impl EditsHandler {
             topic.path.clone()
         } else {
             let fs_root = self.fs_root_content.read().await;
-            let uuid = resolve_path_to_uuid(&fs_root, &topic.path).ok_or_else(|| {
-                MqttError::InvalidMessage(format!("Path not mounted in fs-root: {}", topic.path))
-            })?;
+            let fs_root_id = fs_root_id.as_deref().unwrap_or("");
+            let uuid =
+                resolve_path_to_uuid(&fs_root, &topic.path, fs_root_id).ok_or_else(|| {
+                    MqttError::InvalidMessage(format!(
+                        "Path not mounted in fs-root: {}",
+                        topic.path
+                    ))
+                })?;
             drop(fs_root);
             uuid
         };

@@ -248,20 +248,66 @@ impl DocumentStore {
     }
 }
 
-/// Resolve a path to a UUID by parsing fs-root JSON content.
+/// Resolve a path to a document ID by parsing fs-root JSON content.
+///
+/// The fs-root uses a versioned schema:
+/// ```json
+/// {
+///   "version": 1,
+///   "root": {
+///     "type": "dir",
+///     "entries": {
+///       "notes": { "type": "dir", "entries": { "todo.txt": { "type": "doc", "node_id": "abc-123" } } }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Document ID is either:
+/// - Explicit `node_id` in the schema
+/// - Derived as `<fs_root_id>:<path>` if not specified
+///
 /// Returns None if path not found or JSON invalid.
-pub fn resolve_path_to_uuid(fs_root_content: &str, path: &str) -> Option<String> {
+pub fn resolve_path_to_uuid(fs_root_content: &str, path: &str, fs_root_id: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(fs_root_content).ok()?;
 
-    let parts: Vec<&str> = path.split('/').collect();
-    let mut current = &json;
-
-    for part in parts {
-        current = current.get(part)?;
+    // Parse the versioned schema
+    let root = json.get("root")?;
+    let root_type = root.get("type")?.as_str()?;
+    if root_type != "dir" {
+        return None;
     }
 
-    // The leaf should have a _uuid field
-    current.get("_uuid")?.as_str().map(|s| s.to_string())
+    // Navigate through the path
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut current = root;
+
+    for (i, part) in parts.iter().enumerate() {
+        let entries = current.get("entries")?;
+        current = entries.get(*part)?;
+
+        let entry_type = current.get("type")?.as_str()?;
+
+        // If this is the last part and it's a doc, we found it
+        if i == parts.len() - 1 {
+            if entry_type != "doc" {
+                return None; // Path points to a directory, not a document
+            }
+            // Return node_id if set, otherwise derive from path
+            return current
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some(format!("{}:{}", fs_root_id, path)));
+        }
+
+        // Not the last part, so this should be a directory
+        if entry_type != "dir" {
+            return None;
+        }
+    }
+
+    None
 }
 
 #[derive(Debug)]
@@ -279,22 +325,46 @@ mod tests {
     #[test]
     fn test_resolve_path_to_uuid() {
         let fs_root = r#"{
-            "notes": {
-                "todo.txt": {"_uuid": "abc-123"},
-                "ideas.md": {"_uuid": "def-456"}
-            },
-            "readme.txt": {"_uuid": "ghi-789"}
+            "version": 1,
+            "root": {
+                "type": "dir",
+                "entries": {
+                    "notes": {
+                        "type": "dir",
+                        "entries": {
+                            "todo.txt": { "type": "doc", "node_id": "abc-123" },
+                            "ideas.md": { "type": "doc" }
+                        }
+                    },
+                    "readme.txt": { "type": "doc", "node_id": "ghi-789" }
+                }
+            }
         }"#;
 
+        // Explicit node_id is returned
         assert_eq!(
-            resolve_path_to_uuid(fs_root, "notes/todo.txt"),
+            resolve_path_to_uuid(fs_root, "notes/todo.txt", "fs-root.json"),
             Some("abc-123".to_string())
         );
         assert_eq!(
-            resolve_path_to_uuid(fs_root, "readme.txt"),
+            resolve_path_to_uuid(fs_root, "readme.txt", "fs-root.json"),
             Some("ghi-789".to_string())
         );
-        assert_eq!(resolve_path_to_uuid(fs_root, "nonexistent.txt"), None);
+
+        // Derived document ID when no node_id
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "notes/ideas.md", "fs-root.json"),
+            Some("fs-root.json:notes/ideas.md".to_string())
+        );
+
+        // Path not found
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "nonexistent.txt", "fs-root.json"),
+            None
+        );
+
+        // Path points to directory, not document
+        assert_eq!(resolve_path_to_uuid(fs_root, "notes", "fs-root.json"), None);
     }
 
     #[tokio::test]
