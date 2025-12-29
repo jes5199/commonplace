@@ -200,10 +200,52 @@ impl DocumentStore {
     }
 }
 
+/// Resolve a path to a UUID by parsing fs-root JSON content.
+/// Returns None if path not found or JSON invalid.
+pub fn resolve_path_to_uuid(fs_root_content: &str, path: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(fs_root_content).ok()?;
+
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut current = &json;
+
+    for part in parts {
+        current = current.get(part)?;
+    }
+
+    // The leaf should have a _uuid field
+    current.get("_uuid")?.as_str().map(|s| s.to_string())
+}
+
 #[derive(Debug)]
 pub enum ApplyError {
     NotFound,
     MissingYDoc,
     InvalidUpdate(String),
     Serialization(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_path_to_uuid() {
+        let fs_root = r#"{
+            "notes": {
+                "todo.txt": {"_uuid": "abc-123"},
+                "ideas.md": {"_uuid": "def-456"}
+            },
+            "readme.txt": {"_uuid": "ghi-789"}
+        }"#;
+
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "notes/todo.txt"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(
+            resolve_path_to_uuid(fs_root, "readme.txt"),
+            Some("ghi-789".to_string())
+        );
+        assert_eq!(resolve_path_to_uuid(fs_root, "nonexistent.txt"), None);
+    }
 }
