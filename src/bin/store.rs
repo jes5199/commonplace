@@ -105,6 +105,12 @@ async fn main() {
         .set_fs_root_content(content.clone())
         .await;
 
+    // Set the fs-root path so EditsHandler can refresh cache when fs-root is edited
+    mqtt_service
+        .edits_handler()
+        .set_fs_root_path(args.fs_root.clone())
+        .await;
+
     // Subscribe to store-level commands (e.g., create-document)
     if let Err(e) = mqtt_service.subscribe_store_commands().await {
         tracing::warn!("Failed to subscribe to store commands: {}", e);

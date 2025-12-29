@@ -25,6 +25,8 @@ pub struct EditsHandler {
     commit_store: Option<Arc<CommitStore>>,
     /// Cache of fs-root JSON content for path→UUID resolution.
     fs_root_content: RwLock<String>,
+    /// The fs-root path, so we can refresh the cache when it's edited.
+    fs_root_path: RwLock<Option<String>>,
     subscribed_paths: RwLock<HashSet<String>>,
 }
 
@@ -40,6 +42,7 @@ impl EditsHandler {
             document_store,
             commit_store,
             fs_root_content: RwLock::new(String::new()),
+            fs_root_path: RwLock::new(None),
             subscribed_paths: RwLock::new(HashSet::new()),
         }
     }
@@ -48,6 +51,12 @@ impl EditsHandler {
     pub async fn set_fs_root_content(&self, content: String) {
         let mut fs_root = self.fs_root_content.write().await;
         *fs_root = content;
+    }
+
+    /// Set the fs-root path so we can refresh the cache when it's edited.
+    pub async fn set_fs_root_path(&self, path: String) {
+        let mut fs_root_path = self.fs_root_path.write().await;
+        *fs_root_path = Some(path);
     }
 
     /// Subscribe to edits for a path.
@@ -97,18 +106,30 @@ impl EditsHandler {
             topic.path, edit_msg.author
         );
 
-        // Resolve path to UUID using fs-root content
-        let fs_root = self.fs_root_content.read().await;
-        let uuid = resolve_path_to_uuid(&fs_root, &topic.path).ok_or_else(|| {
-            MqttError::InvalidMessage(format!("Path not mounted in fs-root: {}", topic.path))
-        })?;
-        drop(fs_root); // Release the read lock
+        // Check if this is an fs-root edit (special case: path IS the document ID)
+        let fs_root_path = self.fs_root_path.read().await;
+        let is_fs_root_edit = fs_root_path.as_ref() == Some(&topic.path);
+        drop(fs_root_path);
+
+        // Resolve path to document ID:
+        // - For fs-root: the path IS the document ID
+        // - For other documents: resolve via fs-root content
+        let document_id = if is_fs_root_edit {
+            topic.path.clone()
+        } else {
+            let fs_root = self.fs_root_content.read().await;
+            let uuid = resolve_path_to_uuid(&fs_root, &topic.path).ok_or_else(|| {
+                MqttError::InvalidMessage(format!("Path not mounted in fs-root: {}", topic.path))
+            })?;
+            drop(fs_root);
+            uuid
+        };
 
         // Determine parents: use provided parents, or infer from current HEAD if empty
         let parents = if edit_msg.parents.is_empty() {
             // No parents provided - infer from current document HEAD
             if let Some(store) = &self.commit_store {
-                if let Ok(Some(head)) = store.get_document_head(&topic.path).await {
+                if let Ok(Some(head)) = store.get_document_head(&document_id).await {
                     vec![head]
                 } else {
                     vec![] // No HEAD yet, this is a root commit
@@ -134,11 +155,10 @@ impl EditsHandler {
         let cid = if let Some(store) = &self.commit_store {
             let cid = store.store_commit(&commit).await?;
 
-            // Update document head
-            // Use path as the document ID
-            store.set_document_head(&topic.path, &cid).await?;
+            // Update document head using the document ID (UUID or fs-root path)
+            store.set_document_head(&document_id, &cid).await?;
 
-            debug!("Stored commit {} for path {}", cid, topic.path);
+            debug!("Stored commit {} for document {}", cid, document_id);
             Some(cid)
         } else {
             None
@@ -148,7 +168,7 @@ impl EditsHandler {
         let content_type = content_type_for_path(&topic.path)?;
         let _doc = self
             .document_store
-            .get_or_create_with_id(&uuid, content_type)
+            .get_or_create_with_id(&document_id, content_type)
             .await;
 
         // Decode the base64 update and apply it to the document
@@ -156,7 +176,7 @@ impl EditsHandler {
             .map_err(|e| MqttError::InvalidMessage(format!("Invalid base64 update: {}", e)))?;
 
         self.document_store
-            .apply_yjs_update(&uuid, &update_bytes)
+            .apply_yjs_update(&document_id, &update_bytes)
             .await
             .map_err(|e| {
                 MqttError::InvalidMessage(format!("Failed to apply Yjs update: {:?}", e))
@@ -164,10 +184,19 @@ impl EditsHandler {
 
         debug!(
             "Applied edit to document {} (path: {}, cid: {:?})",
-            uuid,
+            document_id,
             topic.path,
             cid.as_deref().unwrap_or("none")
         );
+
+        // If this was an fs-root edit, refresh the fs-root content cache
+        if is_fs_root_edit {
+            if let Some(doc) = self.document_store.get_document(&document_id).await {
+                let mut fs_root = self.fs_root_content.write().await;
+                *fs_root = doc.content.clone();
+                debug!("Refreshed fs-root content cache after edit");
+            }
+        }
 
         Ok(())
     }
