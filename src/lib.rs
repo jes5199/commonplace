@@ -94,12 +94,7 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
 
     // Initialize MQTT service if configured
     if let Some(mqtt_config) = config.mqtt {
-        match mqtt::MqttService::new(
-            mqtt_config,
-            node_registry.clone(),
-            commit_store.clone(),
-        )
-        .await
+        match mqtt::MqttService::new(mqtt_config, node_registry.clone(), commit_store.clone()).await
         {
             Ok(mqtt_service) => {
                 tracing::info!("MQTT service connected");

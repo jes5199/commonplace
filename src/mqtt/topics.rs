@@ -99,7 +99,10 @@ impl Topic {
 
         let port_str = segments[path_end_idx + 1];
         let port = Port::parse(port_str).ok_or_else(|| {
-            MqttError::InvalidTopic(format!("Invalid port '{}' in topic: {}", port_str, topic_str))
+            MqttError::InvalidTopic(format!(
+                "Invalid port '{}' in topic: {}",
+                port_str, topic_str
+            ))
         })?;
 
         // Remaining segments are the qualifier
@@ -309,19 +312,13 @@ mod tests {
             content_type_for_path("doc.json").unwrap(),
             ContentType::Json
         );
-        assert_eq!(
-            content_type_for_path("doc.txt").unwrap(),
-            ContentType::Text
-        );
+        assert_eq!(content_type_for_path("doc.txt").unwrap(), ContentType::Text);
         assert_eq!(content_type_for_path("doc.xml").unwrap(), ContentType::Xml);
         assert_eq!(
             content_type_for_path("doc.xhtml").unwrap(),
             ContentType::Xml
         );
-        assert_eq!(
-            content_type_for_path("doc.bin").unwrap(),
-            ContentType::Text
-        );
+        assert_eq!(content_type_for_path("doc.bin").unwrap(), ContentType::Text);
         assert_eq!(content_type_for_path("doc.md").unwrap(), ContentType::Text);
     }
 }

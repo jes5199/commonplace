@@ -83,11 +83,7 @@ impl CommandsHandler {
     ///
     /// Commands are dispatched to the target node's red port via `receive_event()`.
     /// The verb becomes the event_type.
-    pub async fn handle_command(
-        &self,
-        topic: &Topic,
-        payload: &[u8],
-    ) -> Result<(), MqttError> {
+    pub async fn handle_command(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
         let verb = topic.qualifier.as_deref().ok_or_else(|| {
             MqttError::InvalidTopic("Command topic missing verb qualifier".to_string())
         })?;

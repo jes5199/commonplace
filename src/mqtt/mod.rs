@@ -100,11 +100,8 @@ impl MqttService {
     ) -> Result<Self, MqttError> {
         let client = Arc::new(MqttClient::connect(config).await?);
 
-        let edits_handler = edits::EditsHandler::new(
-            client.clone(),
-            node_registry.clone(),
-            commit_store.clone(),
-        );
+        let edits_handler =
+            edits::EditsHandler::new(client.clone(), node_registry.clone(), commit_store.clone());
 
         let sync_handler = sync::SyncHandler::new(client.clone(), commit_store.clone());
 
@@ -195,11 +192,15 @@ impl MqttService {
                 let sync_msg: messages::SyncMessage = serde_json::from_slice(payload)?;
                 // Only handle requests, not responses
                 if sync_msg.is_request() {
-                    self.sync_handler.handle_sync_request(&topic, sync_msg).await?;
+                    self.sync_handler
+                        .handle_sync_request(&topic, sync_msg)
+                        .await?;
                 }
             }
             topics::Port::Commands => {
-                self.commands_handler.handle_command(&topic, payload).await?;
+                self.commands_handler
+                    .handle_command(&topic, payload)
+                    .await?;
             }
             topics::Port::Events => {
                 // Events are outbound only from this doc store - we don't receive them

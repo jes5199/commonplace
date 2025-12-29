@@ -37,7 +37,9 @@ impl SyncHandler {
         let topic_pattern = Topic::sync_wildcard(path);
 
         // Use QoS 0 for sync - ephemeral catch-up
-        self.client.subscribe(&topic_pattern, QoS::AtMostOnce).await?;
+        self.client
+            .subscribe(&topic_pattern, QoS::AtMostOnce)
+            .await?;
 
         let mut paths = self.subscribed_paths.write().await;
         paths.insert(path.to_string());
@@ -78,7 +80,9 @@ impl SyncHandler {
             SyncMessage::Head { req, commit: None } => {
                 self.handle_head(&topic.path, client_id, &req).await
             }
-            SyncMessage::Head { commit: Some(_), .. } => {
+            SyncMessage::Head {
+                commit: Some(_), ..
+            } => {
                 // Head response shouldn't be received by doc store
                 warn!("Received unexpected Head response message");
                 Ok(())
@@ -103,12 +107,7 @@ impl SyncHandler {
     }
 
     /// Handle a HEAD request.
-    async fn handle_head(
-        &self,
-        path: &str,
-        client_id: &str,
-        req: &str,
-    ) -> Result<(), MqttError> {
+    async fn handle_head(&self, path: &str, client_id: &str, req: &str) -> Result<(), MqttError> {
         let commit = if let Some(store) = &self.commit_store {
             store.get_document_head(path).await.ok().flatten()
         } else {
@@ -131,9 +130,10 @@ impl SyncHandler {
         req: &str,
         commit_ids: Vec<String>,
     ) -> Result<(), MqttError> {
-        let store = self.commit_store.as_ref().ok_or_else(|| {
-            MqttError::Node("Commit store not initialized".to_string())
-        })?;
+        let store = self
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
         let mut sent_commits = Vec::new();
 
@@ -178,9 +178,10 @@ impl SyncHandler {
         have: Vec<String>,
         want: &str,
     ) -> Result<(), MqttError> {
-        let store = self.commit_store.as_ref().ok_or_else(|| {
-            MqttError::Node("Commit store not initialized".to_string())
-        })?;
+        let store = self
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
         // Resolve "HEAD" to actual commit ID
         let target_cid = if want == "HEAD" {
@@ -246,9 +247,10 @@ impl SyncHandler {
         commit: &str,
         depth: Option<u32>,
     ) -> Result<(), MqttError> {
-        let store = self.commit_store.as_ref().ok_or_else(|| {
-            MqttError::Node("Commit store not initialized".to_string())
-        })?;
+        let store = self
+            .commit_store
+            .as_ref()
+            .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
         // Resolve "HEAD" to actual commit ID
         let start_cid = if commit == "HEAD" {

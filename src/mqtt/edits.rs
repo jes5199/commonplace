@@ -80,8 +80,8 @@ impl EditsHandler {
     /// IMPORTANT: Does NOT re-emit. MQTT broker handles fanout.
     pub async fn handle_edit(&self, topic: &Topic, payload: &[u8]) -> Result<(), MqttError> {
         // Parse the edit message
-        let edit_msg: EditMessage =
-            serde_json::from_slice(payload).map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
+        let edit_msg: EditMessage = serde_json::from_slice(payload)
+            .map_err(|e| MqttError::InvalidMessage(e.to_string()))?;
 
         debug!(
             "Received edit for path: {} from author: {}",
