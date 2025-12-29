@@ -54,12 +54,18 @@ async fn main() {
         }
     });
 
+    // Log MQTT subscriptions if configured
+    for path in &args.mqtt_subscribe {
+        tracing::info!("MQTT subscribe: {}", path);
+    }
+
     // Build our application with routes
     let app = create_router_with_config(RouterConfig {
         commit_store,
         fs_root: args.fs_root,
         routers: args.routers,
         mqtt: mqtt_config,
+        mqtt_subscribe: args.mqtt_subscribe,
     })
     .await;
 

@@ -39,6 +39,8 @@ pub struct RouterConfig {
     pub routers: Vec<String>,
     /// MQTT configuration (if specified, enables MQTT transport)
     pub mqtt: Option<mqtt::MqttConfig>,
+    /// Document paths to subscribe via MQTT (requires mqtt to be set)
+    pub mqtt_subscribe: Vec<String>,
 }
 
 /// Create a router with the given configuration.
@@ -91,10 +93,6 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
     }
 
     // Initialize MQTT service if configured
-    // Note: MQTT topic subscriptions are managed via the MqttService API.
-    // The fs-root is a meta-schema document and is not subscribed to MQTT.
-    // Individual document paths (with extensions like .txt, .json) can be
-    // subscribed using mqtt_service.subscribe_path().
     if let Some(mqtt_config) = config.mqtt {
         match mqtt::MqttService::new(
             mqtt_config,
@@ -104,8 +102,17 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
         .await
         {
             Ok(mqtt_service) => {
-                tracing::info!("MQTT service connected and ready");
+                tracing::info!("MQTT service connected");
                 let mqtt_service = Arc::new(mqtt_service);
+
+                // Subscribe to configured document paths
+                for path in &config.mqtt_subscribe {
+                    if let Err(e) = mqtt_service.subscribe_path(path).await {
+                        tracing::warn!("Failed to subscribe MQTT to path {}: {}", path, e);
+                    } else {
+                        tracing::info!("MQTT subscribed to path: {}", path);
+                    }
+                }
 
                 // Start the event loop
                 let service_for_loop = mqtt_service.clone();

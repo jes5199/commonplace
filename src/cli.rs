@@ -32,4 +32,9 @@ pub struct Args {
     /// MQTT client ID (defaults to generated UUID)
     #[clap(long, value_name = "ID")]
     pub mqtt_client_id: Option<String>,
+
+    /// Document paths to subscribe via MQTT (repeatable, requires --mqtt-broker)
+    /// Paths must include file extensions (e.g., notes/todo.txt, config.json)
+    #[clap(long = "mqtt-subscribe", value_name = "PATH")]
+    pub mqtt_subscribe: Vec<String>,
 }
