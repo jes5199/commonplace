@@ -2116,9 +2116,14 @@ async fn handle_server_edit(
     // We avoid temp+rename because it changes the inode, which breaks
     // inotify file watchers on Linux. Since the server is authoritative,
     // partial writes on crash are recoverable via re-sync.
-    let is_binary = content_info.is_binary;
-    let write_result = if is_binary {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+    //
+    // For binary detection, use both extension-based AND content-based detection:
+    // - If extension suggests binary, decode base64
+    // - If extension says text, still try decoding as base64 in case
+    //   the file was detected as binary by content sniffing on upload
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let write_result = if content_info.is_binary {
+        // Extension says binary - decode base64
         match STANDARD.decode(&head.content) {
             Ok(decoded) => tokio::fs::write(file_path, &decoded).await,
             Err(e) => {
@@ -2132,7 +2137,18 @@ async fn handle_server_edit(
             }
         }
     } else {
-        tokio::fs::write(file_path, &head.content).await
+        // Extension says text, but try decoding as base64 in case
+        // this was a binary file detected by content sniffing on upload
+        match STANDARD.decode(&head.content) {
+            Ok(decoded) if is_binary_content(&decoded) => {
+                // Successfully decoded and content is binary - write decoded bytes
+                tokio::fs::write(file_path, &decoded).await
+            }
+            _ => {
+                // Not base64 or not binary - write as text
+                tokio::fs::write(file_path, &head.content).await
+            }
+        }
     };
 
     if let Err(e) = write_result {
