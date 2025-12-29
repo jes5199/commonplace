@@ -49,7 +49,7 @@ class CounterExample(FileProcess):
             content_type="application/json",
         )
 
-        # Initialize counter value
+        # Initialize counter value (will be synced from document on start)
         self._counter = 0
 
         # Register command handlers
@@ -57,6 +57,40 @@ class CounterExample(FileProcess):
         self.register_command("decrement", self._on_decrement)
         self.register_command("reset", self._on_reset)
         self.register_command("get", self._on_get)
+
+    def start(self, blocking: bool = True) -> None:
+        """Start the counter process, syncing state from any existing document."""
+        # Call parent start (connects, syncs history)
+        super().start(blocking=False)
+
+        # Initialize counter from synced document content
+        self._sync_counter_from_doc()
+
+        print(f"[{self.path}] Counter initialized to {self._counter}")
+
+        if blocking:
+            import time
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print(f"\n[{self.path}] Shutting down...")
+                self.stop()
+
+    def _sync_counter_from_doc(self) -> None:
+        """Sync local counter state from the YDoc content."""
+        content = self.get_content()
+        if "counter" in content:
+            self._counter = int(content["counter"])
+
+    def _handle_edit(self, payload: bytes) -> None:
+        """Handle incoming edit from another client, updating local counter."""
+        # Call parent to apply the Yjs update
+        super()._handle_edit(payload)
+
+        # Update our local counter from the updated document
+        self._sync_counter_from_doc()
+        print(f"[{self.path}] Counter synced to {self._counter}")
 
     def _on_increment(self, payload: dict) -> None:
         """Handle increment command."""
