@@ -1885,11 +1885,17 @@ async fn upload_task(
         }
 
         if is_json {
-            if let Err(e) = push_json_content(&client, &server, &node_id, &content, &state).await {
-                error!("JSON upload failed: {}", e);
-            }
-            // Refresh from HEAD if server edits were skipped
-            if should_refresh {
+            let json_upload_succeeded =
+                match push_json_content(&client, &server, &node_id, &content, &state).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        error!("JSON upload failed: {}", e);
+                        false
+                    }
+                };
+            // Refresh from HEAD if server edits were skipped AND upload succeeded
+            // IMPORTANT: Don't refresh after failed upload to avoid overwriting local edits
+            if should_refresh && json_upload_succeeded {
                 refresh_from_head(&client, &server, &node_id, &file_path, &state).await;
             }
             continue;
