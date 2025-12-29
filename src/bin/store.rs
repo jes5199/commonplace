@@ -99,15 +99,23 @@ async fn main() {
             }
         };
 
-    // Populate the EditsHandler's fs_root_content cache for path->UUID resolution
+    // Populate the handlers' fs_root_content cache for path->document ID resolution
     mqtt_service
         .edits_handler()
         .set_fs_root_content(content.clone())
         .await;
+    mqtt_service
+        .sync_handler()
+        .set_fs_root_content(content.clone())
+        .await;
 
-    // Set the fs-root path so EditsHandler can refresh cache when fs-root is edited
+    // Set the fs-root path so handlers can resolve paths correctly
     mqtt_service
         .edits_handler()
+        .set_fs_root_path(args.fs_root.clone())
+        .await;
+    mqtt_service
+        .sync_handler()
         .set_fs_root_path(args.fs_root.clone())
         .await;
 

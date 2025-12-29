@@ -3,6 +3,7 @@
 //! Implements the git-like merkle tree synchronization protocol.
 //! Subscribes to `{path}/sync/+` wildcard and responds to sync requests.
 
+use crate::document::resolve_path_to_uuid;
 use crate::mqtt::client::MqttClient;
 use crate::mqtt::messages::SyncMessage;
 use crate::mqtt::topics::Topic;
@@ -19,6 +20,10 @@ pub struct SyncHandler {
     client: Arc<MqttClient>,
     commit_store: Option<Arc<CommitStore>>,
     subscribed_paths: RwLock<HashSet<String>>,
+    /// Cache of fs-root JSON content for path→document ID resolution.
+    fs_root_content: RwLock<String>,
+    /// The fs-root path/ID.
+    fs_root_path: RwLock<Option<String>>,
 }
 
 impl SyncHandler {
@@ -28,6 +33,36 @@ impl SyncHandler {
             client,
             commit_store,
             subscribed_paths: RwLock::new(HashSet::new()),
+            fs_root_content: RwLock::new(String::new()),
+            fs_root_path: RwLock::new(None),
+        }
+    }
+
+    /// Update the cached fs-root content for path resolution.
+    pub async fn set_fs_root_content(&self, content: String) {
+        let mut fs_root = self.fs_root_content.write().await;
+        *fs_root = content;
+    }
+
+    /// Set the fs-root path.
+    pub async fn set_fs_root_path(&self, path: String) {
+        let mut fs_root_path = self.fs_root_path.write().await;
+        *fs_root_path = Some(path);
+    }
+
+    /// Resolve a path to a document ID.
+    async fn resolve_document_id(&self, path: &str) -> Option<String> {
+        let fs_root_path = self.fs_root_path.read().await;
+        let is_fs_root = fs_root_path.as_ref() == Some(&path.to_string());
+        let fs_root_id = fs_root_path.clone();
+        drop(fs_root_path);
+
+        if is_fs_root {
+            Some(path.to_string())
+        } else {
+            let fs_root = self.fs_root_content.read().await;
+            let fs_root_id = fs_root_id.as_deref().unwrap_or("");
+            resolve_path_to_uuid(&fs_root, path, fs_root_id)
         }
     }
 
@@ -108,8 +143,11 @@ impl SyncHandler {
 
     /// Handle a HEAD request.
     async fn handle_head(&self, path: &str, client_id: &str, req: &str) -> Result<(), MqttError> {
-        let commit = if let Some(store) = &self.commit_store {
-            store.get_document_head(path).await.ok().flatten()
+        // Resolve path to document ID
+        let doc_id = self.resolve_document_id(path).await;
+
+        let commit = if let (Some(store), Some(doc_id)) = (&self.commit_store, &doc_id) {
+            store.get_document_head(doc_id).await.ok().flatten()
         } else {
             None
         };
@@ -183,9 +221,15 @@ impl SyncHandler {
             .as_ref()
             .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
+        // Resolve path to document ID
+        let doc_id = self
+            .resolve_document_id(path)
+            .await
+            .ok_or_else(|| MqttError::InvalidTopic(format!("Path not mounted: {}", path)))?;
+
         // Resolve "HEAD" to actual commit ID
         let target_cid = if want == "HEAD" {
-            match store.get_document_head(path).await? {
+            match store.get_document_head(&doc_id).await? {
                 Some(cid) => cid,
                 None => {
                     // Empty document, send done with no commits
@@ -252,9 +296,15 @@ impl SyncHandler {
             .as_ref()
             .ok_or_else(|| MqttError::Node("Commit store not initialized".to_string()))?;
 
+        // Resolve path to document ID
+        let doc_id = self
+            .resolve_document_id(path)
+            .await
+            .ok_or_else(|| MqttError::InvalidTopic(format!("Path not mounted: {}", path)))?;
+
         // Resolve "HEAD" to actual commit ID
         let start_cid = if commit == "HEAD" {
-            match store.get_document_head(path).await? {
+            match store.get_document_head(&doc_id).await? {
                 Some(cid) => cid,
                 None => {
                     // Empty document
