@@ -87,3 +87,25 @@ pub struct HttpArgs {
     #[clap(long, value_name = "ID", default_value = "commonplace-http")]
     pub mqtt_client_id: String,
 }
+
+/// CLI arguments for the orchestrator binary
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-orchestrator")]
+#[clap(about = "Process supervisor for commonplace services", long_about = None)]
+pub struct OrchestratorArgs {
+    /// Path to config file
+    #[clap(long, default_value = "commonplace.json")]
+    pub config: PathBuf,
+
+    /// Override MQTT broker address
+    #[clap(long, value_name = "URL")]
+    pub mqtt_broker: Option<String>,
+
+    /// Disable a specific process
+    #[clap(long, value_name = "NAME")]
+    pub disable: Vec<String>,
+
+    /// Run only a specific process (skip dependencies)
+    #[clap(long, value_name = "NAME")]
+    pub only: Option<String>,
+}
