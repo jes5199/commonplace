@@ -6,6 +6,7 @@ pub mod dir_sync;
 pub mod directory;
 pub mod file_sync;
 pub mod sse;
+pub mod state;
 pub mod state_file;
 pub mod types;
 pub mod urls;
@@ -18,6 +19,7 @@ pub use directory::{
     scan_directory, scan_directory_with_contents, schema_to_json, ScanError, ScanOptions,
     ScannedFile,
 };
+pub use state::{PendingWrite, SyncState};
 pub use types::{
     CommitData, DirEvent, EditEventData, EditRequest, EditResponse, FileEvent, ForkResponse,
     HeadResponse, ReplaceResponse, ReplaceSummary,

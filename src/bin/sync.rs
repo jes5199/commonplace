@@ -12,7 +12,8 @@ use commonplace_doc::sync::{
     create_yjs_json_update, create_yjs_text_update, detect_from_path, encode_node_id,
     is_allowed_extension, is_binary_content, normalize_path, scan_directory,
     scan_directory_with_contents, schema_to_json, DirEvent, EditEventData, EditRequest,
-    EditResponse, FileEvent, ForkResponse, HeadResponse, ReplaceResponse, ScanOptions,
+    EditResponse, FileEvent, ForkResponse, HeadResponse, PendingWrite, ReplaceResponse,
+    ScanOptions, SyncState,
 };
 use futures::StreamExt;
 use notify::event::{ModifyKind, RenameMode};
@@ -91,80 +92,6 @@ struct Args {
     /// Additional arguments to pass to the exec command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     exec_args: Vec<String>,
-}
-
-/// Pending write from server - used for barrier-based echo detection
-#[derive(Debug, Clone)]
-struct PendingWrite {
-    /// Unique token for this write operation
-    write_id: u64,
-    /// Content being written
-    content: String,
-    /// CID of the commit being written
-    cid: Option<String>,
-    /// When this write started (for timeout detection)
-    started_at: std::time::Instant,
-}
-
-/// Shared state between file watcher and SSE tasks
-#[derive(Debug)]
-struct SyncState {
-    /// CID of the commit we last wrote to the local file
-    last_written_cid: Option<String>,
-    /// Content we last wrote to the local file (for echo detection)
-    last_written_content: String,
-    /// Monotonic counter for write operations
-    current_write_id: u64,
-    /// Currently pending server write (barrier is "up" when Some)
-    pending_write: Option<PendingWrite>,
-    /// Flag indicating a server edit was skipped while barrier was up
-    /// upload_task should refresh HEAD after clearing barrier if this is true
-    needs_head_refresh: bool,
-    /// Persistent state file for offline change detection (file mode only)
-    state_file: Option<SyncStateFile>,
-    /// Path to save the state file
-    state_file_path: Option<PathBuf>,
-}
-
-impl SyncState {
-    fn new() -> Self {
-        Self {
-            last_written_cid: None,
-            last_written_content: String::new(),
-            current_write_id: 0,
-            pending_write: None,
-            needs_head_refresh: false,
-            state_file: None,
-            state_file_path: None,
-        }
-    }
-
-    fn with_state_file(state_file: SyncStateFile, state_file_path: PathBuf) -> Self {
-        Self {
-            last_written_cid: state_file.last_synced_cid.clone(),
-            last_written_content: String::new(),
-            current_write_id: 0,
-            pending_write: None,
-            needs_head_refresh: false,
-            state_file: Some(state_file),
-            state_file_path: Some(state_file_path),
-        }
-    }
-
-    /// Update state file after successful sync and save to disk
-    async fn mark_synced(&mut self, cid: &str, content_hash: &str, relative_path: &str) {
-        if let Some(ref mut state_file) = self.state_file {
-            state_file.mark_synced(cid.to_string());
-            state_file.update_file(relative_path, content_hash.to_string());
-
-            // Save to disk
-            if let Some(ref path) = self.state_file_path {
-                if let Err(e) = state_file.save(path).await {
-                    warn!("Failed to save state file: {}", e);
-                }
-            }
-        }
-    }
 }
 
 /// Filename for the local schema JSON file written during directory sync
