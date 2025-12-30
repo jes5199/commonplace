@@ -2579,3 +2579,299 @@ async fn handle_server_edit(
         ),
     }
 }
+
+// ============================================================================
+// Tests - Safety net for refactoring (see docs/plans/2025-12-30-sync-test-coverage-design.md)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod url_encoding {
+        use super::*;
+
+        #[test]
+        fn test_encode_node_id_simple() {
+            assert_eq!(encode_node_id("test-node"), "test-node");
+        }
+
+        #[test]
+        fn test_encode_node_id_with_slashes() {
+            assert_eq!(
+                encode_node_id("fs-root:notes/todo.txt"),
+                "fs-root%3Anotes%2Ftodo.txt"
+            );
+        }
+
+        #[test]
+        fn test_encode_node_id_with_spaces() {
+            assert_eq!(encode_node_id("my node"), "my%20node");
+        }
+
+        #[test]
+        fn test_encode_node_id_empty() {
+            assert_eq!(encode_node_id(""), "");
+        }
+
+        #[test]
+        fn test_encode_path_simple() {
+            assert_eq!(encode_path("notes/todo.txt"), "notes/todo.txt");
+        }
+
+        #[test]
+        fn test_encode_path_with_spaces() {
+            assert_eq!(
+                encode_path("my notes/my file.txt"),
+                "my%20notes/my%20file.txt"
+            );
+        }
+
+        #[test]
+        fn test_encode_path_nested() {
+            assert_eq!(encode_path("a/b/c/d.txt"), "a/b/c/d.txt");
+        }
+
+        #[test]
+        fn test_encode_path_special_chars() {
+            assert_eq!(encode_path("notes/file#1.txt"), "notes/file%231.txt");
+        }
+
+        #[test]
+        fn test_normalize_path_forward_slashes() {
+            assert_eq!(normalize_path("notes/todo.txt"), "notes/todo.txt");
+        }
+
+        #[test]
+        fn test_normalize_path_backslashes() {
+            assert_eq!(normalize_path("notes\\todo.txt"), "notes/todo.txt");
+        }
+
+        #[test]
+        fn test_normalize_path_mixed() {
+            assert_eq!(normalize_path("notes\\sub/file.txt"), "notes/sub/file.txt");
+        }
+    }
+
+    mod url_builders {
+        use super::*;
+
+        const SERVER: &str = "http://localhost:3000";
+
+        #[test]
+        fn test_build_head_url_with_paths() {
+            let url = build_head_url(SERVER, "notes/todo.txt", true);
+            assert_eq!(url, "http://localhost:3000/files/notes/todo.txt/head");
+        }
+
+        #[test]
+        fn test_build_head_url_with_id() {
+            let url = build_head_url(SERVER, "abc-123", false);
+            assert_eq!(url, "http://localhost:3000/docs/abc-123/head");
+        }
+
+        #[test]
+        fn test_build_head_url_id_with_special_chars() {
+            let url = build_head_url(SERVER, "fs-root:notes/todo.txt", false);
+            assert_eq!(
+                url,
+                "http://localhost:3000/docs/fs-root%3Anotes%2Ftodo.txt/head"
+            );
+        }
+
+        #[test]
+        fn test_build_edit_url_with_paths() {
+            let url = build_edit_url(SERVER, "notes/todo.txt", true);
+            assert_eq!(url, "http://localhost:3000/files/notes/todo.txt/edit");
+        }
+
+        #[test]
+        fn test_build_edit_url_with_id() {
+            let url = build_edit_url(SERVER, "abc-123", false);
+            assert_eq!(url, "http://localhost:3000/docs/abc-123/edit");
+        }
+
+        #[test]
+        fn test_build_replace_url_with_paths() {
+            let url = build_replace_url(SERVER, "notes/todo.txt", "cid123", true);
+            assert_eq!(
+                url,
+                "http://localhost:3000/files/notes/todo.txt/replace?parent_cid=cid123&author=sync-client"
+            );
+        }
+
+        #[test]
+        fn test_build_replace_url_with_id() {
+            let url = build_replace_url(SERVER, "abc-123", "cid456", false);
+            assert_eq!(
+                url,
+                "http://localhost:3000/docs/abc-123/replace?parent_cid=cid456&author=sync-client"
+            );
+        }
+
+        #[test]
+        fn test_build_sse_url_with_paths() {
+            let url = build_sse_url(SERVER, "notes/todo.txt", true);
+            assert_eq!(url, "http://localhost:3000/sse/files/notes/todo.txt");
+        }
+
+        #[test]
+        fn test_build_sse_url_with_id() {
+            let url = build_sse_url(SERVER, "abc-123", false);
+            assert_eq!(url, "http://localhost:3000/sse/docs/abc-123");
+        }
+
+        #[test]
+        fn test_build_urls_with_spaces_in_path() {
+            let url = build_head_url(SERVER, "my notes/my file.txt", true);
+            assert_eq!(
+                url,
+                "http://localhost:3000/files/my%20notes/my%20file.txt/head"
+            );
+        }
+    }
+
+    mod yjs_updates {
+        use super::*;
+
+        #[test]
+        fn test_create_yjs_text_update_empty() {
+            let update = create_yjs_text_update("");
+            // Should produce a valid base64 string
+            assert!(!update.is_empty());
+            // Should be decodable
+            assert!(base64_decode(&update).is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_text_update_simple() {
+            let update = create_yjs_text_update("hello world");
+            assert!(!update.is_empty());
+            assert!(base64_decode(&update).is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_text_update_unicode() {
+            let update = create_yjs_text_update("Hello 世界 🌍");
+            assert!(!update.is_empty());
+            assert!(base64_decode(&update).is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_json_update_object() {
+            let result = create_yjs_json_update(r#"{"key": "value"}"#, None);
+            assert!(result.is_ok());
+            let update = result.unwrap();
+            assert!(!update.is_empty());
+            assert!(base64_decode(&update).is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_json_update_array() {
+            let result = create_yjs_json_update(r#"[1, 2, 3]"#, None);
+            assert!(result.is_ok());
+            let update = result.unwrap();
+            assert!(!update.is_empty());
+        }
+
+        #[test]
+        fn test_create_yjs_json_update_nested() {
+            let result = create_yjs_json_update(r#"{"nested": {"deep": [1, 2, 3]}}"#, None);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_create_yjs_json_update_primitive_fails() {
+            let result = create_yjs_json_update(r#""just a string""#, None);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_create_yjs_json_update_invalid_json() {
+            let result = create_yjs_json_update("not valid json", None);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_json_value_to_any_null() {
+            let any = json_value_to_any(serde_json::Value::Null);
+            assert!(matches!(any, Any::Null));
+        }
+
+        #[test]
+        fn test_json_value_to_any_bool() {
+            let any = json_value_to_any(serde_json::Value::Bool(true));
+            assert!(matches!(any, Any::Bool(true)));
+        }
+
+        #[test]
+        fn test_json_value_to_any_integer() {
+            let any = json_value_to_any(serde_json::json!(42));
+            assert!(matches!(any, Any::BigInt(42)));
+        }
+
+        #[test]
+        fn test_json_value_to_any_float() {
+            let any = json_value_to_any(serde_json::json!(3.14));
+            match any {
+                Any::Number(n) => assert!((n - 3.14).abs() < 0.001),
+                _ => panic!("Expected Number"),
+            }
+        }
+
+        #[test]
+        fn test_json_value_to_any_string() {
+            let any = json_value_to_any(serde_json::json!("hello"));
+            match any {
+                Any::String(s) => assert_eq!(s.as_ref(), "hello"),
+                _ => panic!("Expected String"),
+            }
+        }
+
+        #[test]
+        fn test_json_value_to_any_array() {
+            let any = json_value_to_any(serde_json::json!([1, 2, 3]));
+            assert!(matches!(any, Any::Array(_)));
+        }
+
+        #[test]
+        fn test_json_value_to_any_object() {
+            let any = json_value_to_any(serde_json::json!({"key": "value"}));
+            assert!(matches!(any, Any::Map(_)));
+        }
+    }
+
+    mod utilities {
+        use super::*;
+
+        #[test]
+        fn test_base64_roundtrip_empty() {
+            let data = b"";
+            let encoded = base64_encode(data);
+            let decoded = base64_decode(&encoded).unwrap();
+            assert_eq!(decoded, data);
+        }
+
+        #[test]
+        fn test_base64_roundtrip_simple() {
+            let data = b"hello world";
+            let encoded = base64_encode(data);
+            let decoded = base64_decode(&encoded).unwrap();
+            assert_eq!(decoded, data);
+        }
+
+        #[test]
+        fn test_base64_roundtrip_binary() {
+            let data: Vec<u8> = (0..=255).collect();
+            let encoded = base64_encode(&data);
+            let decoded = base64_decode(&encoded).unwrap();
+            assert_eq!(decoded, data);
+        }
+
+        #[test]
+        fn test_base64_decode_invalid() {
+            let result = base64_decode("not valid base64!!!");
+            assert!(result.is_err());
+        }
+    }
+}
