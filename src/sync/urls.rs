@@ -4,8 +4,8 @@
 //! and to build URLs for various API endpoints.
 
 /// URL-encode a node ID for use in URL paths.
-/// Node IDs for nested files contain `/` (e.g., `fs-root:notes/idea.md`) which
-/// must be percent-encoded to avoid breaking Axum's path parameter routing.
+/// Node IDs are typically UUIDs which don't need encoding, but this function
+/// handles any special characters that may appear in custom IDs.
 pub fn encode_node_id(node_id: &str) -> String {
     urlencoding::encode(node_id).into_owned()
 }
