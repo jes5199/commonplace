@@ -33,12 +33,17 @@ use tracing::{debug, error, info, warn};
 #[command(name = "commonplace-sync")]
 #[command(about = "Sync a local file or directory with a Commonplace document node")]
 struct Args {
-    /// Server URL
-    #[arg(short, long, default_value = "http://localhost:3000")]
+    /// Server URL (also reads from COMMONPLACE_SERVER env var)
+    #[arg(
+        short,
+        long,
+        default_value = "http://localhost:3000",
+        env = "COMMONPLACE_SERVER"
+    )]
     server: String,
 
-    /// Node ID to sync with (optional if --fork-from is provided)
-    #[arg(short, long)]
+    /// Node ID to sync with (also reads from COMMONPLACE_NODE env var; optional if --fork-from is provided)
+    #[arg(short, long, env = "COMMONPLACE_NODE")]
     node: Option<String>,
 
     /// Local file path to sync (mutually exclusive with --directory)
@@ -49,8 +54,8 @@ struct Args {
     #[arg(short, long, conflicts_with = "file")]
     directory: Option<PathBuf>,
 
-    /// Fork from this node before syncing (creates a new node)
-    #[arg(long)]
+    /// Fork from this node before syncing (also reads from COMMONPLACE_FORK_FROM env var; creates a new node)
+    #[arg(long, env = "COMMONPLACE_FORK_FROM")]
     fork_from: Option<String>,
 
     /// When forking, use this commit instead of HEAD
@@ -281,7 +286,7 @@ async fn run_file_mode(
         .await
         .map_err(|e| format!("Failed to load state file: {}", e))?;
 
-    // Check for offline local changes
+    // Check for offline local changes and merge them before initial_sync
     if let Some(last_cid) = &state_file.last_synced_cid {
         if file.exists() {
             let current_content = tokio::fs::read(&file).await?;
@@ -293,9 +298,54 @@ async fn run_file_mode(
                     "Detected offline local changes (last synced at {})",
                     last_cid
                 );
-                // TODO: Fetch historical Yjs state at last_synced_cid
-                // and merge local changes via CRDT. For now, log the detection.
-                // The merge logic will be implemented in a follow-up commit.
+
+                // Push offline changes using replace endpoint with last_synced_cid as parent.
+                // The server computes a diff from historical state and creates a CRDT update,
+                // which automatically merges with any concurrent server changes.
+                let content_info = detect_from_path(&file);
+                let is_binary = content_info.is_binary || is_binary_content(&current_content);
+                let content_str = if is_binary {
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    STANDARD.encode(&current_content)
+                } else {
+                    String::from_utf8_lossy(&current_content).to_string()
+                };
+
+                let replace_url = build_replace_url(&server, &node_id, last_cid, false);
+                info!("Pushing offline changes via CRDT merge...");
+
+                match client
+                    .post(&replace_url)
+                    .header("content-type", "text/plain")
+                    .body(content_str)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            match resp.json::<ReplaceResponse>().await {
+                                Ok(result) => {
+                                    info!(
+                                        "Merged offline changes: {} chars inserted, {} deleted (new cid: {})",
+                                        result.summary.chars_inserted,
+                                        result.summary.chars_deleted,
+                                        &result.cid[..8.min(result.cid.len())]
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse replace response: {}", e);
+                                }
+                            }
+                        } else {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!("Failed to push offline changes: {} - {}", status, body);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to push offline changes: {}", e);
+                    }
+                }
             }
         }
     }
