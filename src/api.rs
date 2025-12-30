@@ -540,21 +540,49 @@ async fn replace_doc(
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Generate diff
-    let diff_result = crate::diff::compute_diff_update(&doc.content, &body)
+    // Get current HEAD to check if parent_cid differs
+    let current_head = commit_store
+        .get_document_head(&id)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Determine parent
-    let parent = if let Some(p) = params.parent_cid {
-        Some(p)
-    } else {
-        commit_store
-            .get_document_head(&id)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    // Determine parents and compute diff appropriately
+    let (diff_result, parents) = if let Some(ref parent_cid) = params.parent_cid {
+        // Check if parent differs from current HEAD
+        let parent_differs = current_head.as_ref() != Some(parent_cid);
 
-    let parents: Vec<String> = parent.into_iter().collect();
+        if parent_differs {
+            // Parent differs from HEAD - use historical state for proper CRDT merge
+            // This ensures offline client changes merge correctly with concurrent server changes
+            let replayer = crate::replay::CommitReplayer::new(commit_store);
+            let (old_content, base_state_bytes) = replayer
+                .get_content_and_state_at_commit(&id, parent_cid, &doc.content_type)
+                .await
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+
+            let diff =
+                crate::diff::compute_diff_update_with_base(&base_state_bytes, &old_content, &body)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            // Include BOTH parents for merge commit: client's parent AND current HEAD
+            // This preserves concurrent edits in the commit graph for proper history replay
+            let mut merge_parents = vec![parent_cid.clone()];
+            if let Some(head) = current_head {
+                merge_parents.push(head);
+            }
+            (diff, merge_parents)
+        } else {
+            // Parent matches HEAD - use current content for diff
+            let diff = crate::diff::compute_diff_update(&doc.content, &body)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            (diff, vec![parent_cid.clone()])
+        }
+    } else {
+        // No parent specified - use current content and HEAD as parent
+        let diff = crate::diff::compute_diff_update(&doc.content, &body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        (diff, current_head.into_iter().collect())
+    };
     let author = params.author.unwrap_or_else(|| "anonymous".to_string());
 
     let commit = Commit::new(parents, diff_result.update_b64.clone(), author, None);
