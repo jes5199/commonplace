@@ -29,12 +29,15 @@ pub struct DiscoveredProcess {
 }
 
 /// Command specification - supports both simple string and array formats.
+///
+/// Note: The simple string form uses whitespace splitting, not shell-style quoting.
+/// For commands with spaces in arguments, use the array form instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CommandSpec {
-    /// Simple command string (will be shell-parsed)
+    /// Simple command string (split on whitespace - no quoting support)
     Simple(String),
-    /// Array of command and arguments
+    /// Array of command and arguments (recommended for complex commands)
     Array(Vec<String>),
 }
 
@@ -293,7 +296,8 @@ impl DiscoveredProcessManager {
                         }
                     }
                 } else {
-                    false
+                    // No handle - retry if in Failed state (handles spawn failures)
+                    process.state == DiscoveredProcessState::Failed
                 }
             };
 
