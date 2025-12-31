@@ -2,8 +2,8 @@
   "mqtt_broker": "localhost:1883",
   "processes": {
     "store": {
-      "command": "commonplace-store",
-      "args": ["--database", "./data.redb", "--fs-root", "fs-root.json"],
+      "command": "/home/jes/commonplace/target/release/commonplace-store",
+      "args": ["--database", "./bartleby-test.redb", "--fs-root", "bartleby-workspace.json"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
@@ -11,7 +11,7 @@
       }
     },
     "http": {
-      "command": "commonplace-http",
+      "command": "/home/jes/commonplace/target/release/commonplace-http",
       "args": ["--port", "3000"],
       "restart": {
         "policy": "always",
@@ -19,6 +19,27 @@
         "max_backoff_ms": 10000
       },
       "depends_on": ["store"]
+    },
+    "sync": {
+      "command": "/home/jes/commonplace/target/release/commonplace-sync",
+      "args": ["--server", "http://localhost:3000", "--node", "bartleby-workspace.json", "--directory", "./workspace"],
+      "restart": {
+        "policy": "always",
+        "backoff_ms": 500,
+        "max_backoff_ms": 10000
+      },
+      "depends_on": ["http"]
+    },
+    "bartleby": {
+      "command": "python3",
+      "args": ["/home/jes/bartleby/bartleby.py"],
+      "cwd": "/home/jes/commonplace/workspace",
+      "restart": {
+        "policy": "always",
+        "backoff_ms": 1000,
+        "max_backoff_ms": 30000
+      },
+      "depends_on": ["sync"]
     }
   }
 }
