@@ -357,7 +357,7 @@ mod tests {
 
         let config = DiscoveredProcess {
             command: CommandSpec::Simple("python test.py".to_string()),
-            owns: "test.json".to_string(),
+            owns: Some("test.json".to_string()),
             cwd: PathBuf::from("/tmp"),
         };
 
