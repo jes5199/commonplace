@@ -205,4 +205,30 @@ mod tests {
         assert!(config.processes.contains_key("frontend"));
         assert!(config.processes.contains_key("backend"));
     }
+
+    #[test]
+    fn test_mixed_file_and_directory_attached() {
+        let json = r#"{
+            "processes": {
+                "counter": {
+                    "command": "python counter.py",
+                    "owns": "counter.json",
+                    "cwd": "/app/counter"
+                },
+                "sandbox": {
+                    "command": "commonplace-sync --sandbox --exec ./run.sh",
+                    "cwd": "/app/sandbox"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 2);
+
+        let counter = &config.processes["counter"];
+        assert_eq!(counter.owns, Some("counter.json".to_string()));
+
+        let sandbox = &config.processes["sandbox"];
+        assert!(sandbox.owns.is_none());
+    }
 }
