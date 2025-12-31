@@ -43,7 +43,7 @@ struct Args {
     )]
     server: String,
 
-    /// Node ID to sync with (also reads from COMMONPLACE_NODE env var; optional if --fork-from is provided)
+    /// Node ID to sync with (reads from COMMONPLACE_NODE or COMMONPLACE_PATH env vars; optional if --fork-from is provided)
     #[arg(short, long, env = "COMMONPLACE_NODE")]
     node: Option<String>,
 
@@ -141,6 +141,12 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    // COMMONPLACE_PATH is an alias for --node (for conductor compatibility)
+    let node = args
+        .node
+        .clone()
+        .or_else(|| std::env::var("COMMONPLACE_PATH").ok());
+
     // Validate that either --file, --directory, or --sandbox is provided
     if args.file.is_none() && args.directory.is_none() && !args.sandbox {
         error!("Either --file, --directory, or --sandbox must be provided");
@@ -159,10 +165,10 @@ async fn main() -> ExitCode {
     let client = Client::new();
 
     // Determine the node ID to sync with
-    let node_id = match (&args.node, &args.fork_from) {
-        (Some(node), None) => {
+    let node_id = match (&node, &args.fork_from) {
+        (Some(n), None) => {
             // Direct sync to existing node
-            node.clone()
+            n.clone()
         }
         (None, Some(source)) => {
             // Fork first, then sync to new node
@@ -175,13 +181,13 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        (Some(node), Some(source)) => {
+        (Some(n), Some(source)) => {
             // Both provided - use --node but warn
             warn!(
                 "--node and --fork-from both provided; using --node={} (ignoring --fork-from={})",
-                node, source
+                n, source
             );
-            node.clone()
+            n.clone()
         }
         (None, None) => {
             error!("Either --node or --fork-from must be provided");

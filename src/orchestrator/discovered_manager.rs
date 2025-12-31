@@ -43,6 +43,8 @@ pub struct ManagedDiscoveredProcess {
 pub struct DiscoveredProcessManager {
     /// MQTT broker address
     mqtt_broker: String,
+    /// HTTP server URL
+    server_url: String,
     /// Currently managed processes
     processes: HashMap<String, ManagedDiscoveredProcess>,
     /// Initial backoff in milliseconds
@@ -55,9 +57,10 @@ pub struct DiscoveredProcessManager {
 
 impl DiscoveredProcessManager {
     /// Create a new discovered process manager.
-    pub fn new(mqtt_broker: String) -> Self {
+    pub fn new(mqtt_broker: String, server_url: String) -> Self {
         Self {
             mqtt_broker,
+            server_url,
             processes: HashMap::new(),
             initial_backoff_ms: 500,
             max_backoff_ms: 10_000,
@@ -68,6 +71,11 @@ impl DiscoveredProcessManager {
     /// Get the MQTT broker address.
     pub fn mqtt_broker(&self) -> &str {
         &self.mqtt_broker
+    }
+
+    /// Get the HTTP server URL.
+    pub fn server_url(&self) -> &str {
+        &self.server_url
     }
 
     /// Get all managed processes.
@@ -147,6 +155,7 @@ impl DiscoveredProcessManager {
         // Set environment variables
         cmd.env("COMMONPLACE_PATH", document_path);
         cmd.env("COMMONPLACE_MQTT", &mqtt_broker);
+        cmd.env("COMMONPLACE_SERVER", &self.server_url);
 
         // Capture stdout/stderr
         cmd.stdout(Stdio::piped());
@@ -346,18 +355,25 @@ mod tests {
 
     #[test]
     fn test_discovered_process_manager_new() {
-        let manager = DiscoveredProcessManager::new("localhost:1883".to_string());
+        let manager = DiscoveredProcessManager::new(
+            "localhost:1883".to_string(),
+            "http://localhost:3000".to_string(),
+        );
         assert_eq!(manager.mqtt_broker(), "localhost:1883");
+        assert_eq!(manager.server_url(), "http://localhost:3000");
         assert!(manager.processes().is_empty());
     }
 
     #[test]
     fn test_add_process() {
-        let mut manager = DiscoveredProcessManager::new("localhost:1883".to_string());
+        let mut manager = DiscoveredProcessManager::new(
+            "localhost:1883".to_string(),
+            "http://localhost:3000".to_string(),
+        );
 
         let config = DiscoveredProcess {
             command: CommandSpec::Simple("python test.py".to_string()),
-            owns: "test.json".to_string(),
+            owns: Some("test.json".to_string()),
             cwd: PathBuf::from("/tmp"),
         };
 
@@ -368,5 +384,36 @@ mod tests {
         assert_eq!(process.name, "test");
         assert_eq!(process.document_path, "examples/test.json");
         assert_eq!(process.state, DiscoveredProcessState::Stopped);
+    }
+
+    #[test]
+    fn test_add_directory_attached_process() {
+        let mut manager = DiscoveredProcessManager::new(
+            "localhost:1883".to_string(),
+            "http://localhost:3000".to_string(),
+        );
+
+        let config = DiscoveredProcess {
+            command: CommandSpec::Simple("sync --sandbox".to_string()),
+            owns: None,
+            cwd: PathBuf::from("/tmp"),
+        };
+
+        // For directory-attached, document_path is just the directory
+        manager.add_process("sandbox".to_string(), "examples".to_string(), config);
+
+        assert_eq!(manager.processes().len(), 1);
+        let process = manager.processes().get("sandbox").unwrap();
+        assert_eq!(process.document_path, "examples");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_sets_server_env() {
+        let manager = DiscoveredProcessManager::new(
+            "localhost:1883".to_string(),
+            "http://localhost:3000".to_string(),
+        );
+
+        assert_eq!(manager.server_url(), "http://localhost:3000");
     }
 }

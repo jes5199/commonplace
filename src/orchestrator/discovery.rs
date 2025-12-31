@@ -20,8 +20,10 @@ pub struct ProcessesConfig {
 pub struct DiscoveredProcess {
     /// Command to run (either a string or array of strings)
     pub command: CommandSpec,
-    /// Relative path within same directory that this process owns
-    pub owns: String,
+    /// Relative path within same directory that this process owns (file-attached).
+    /// If absent, process is directory-attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns: Option<String>,
     /// Required absolute path on host for working directory
     pub cwd: PathBuf,
 }
@@ -94,7 +96,7 @@ mod tests {
         assert!(matches!(counter.command, CommandSpec::Simple(_)));
         assert_eq!(counter.command.program(), "python");
         assert_eq!(counter.command.args(), vec!["counter.py"]);
-        assert_eq!(counter.owns, "counter.json");
+        assert_eq!(counter.owns, Some("counter.json".to_string()));
         assert_eq!(counter.cwd, PathBuf::from("/home/user/examples"));
     }
 
@@ -117,7 +119,7 @@ mod tests {
         assert!(matches!(server.command, CommandSpec::Array(_)));
         assert_eq!(server.command.program(), "node");
         assert_eq!(server.command.args(), vec!["server.js", "--port", "3000"]);
-        assert_eq!(server.owns, "state.json");
+        assert_eq!(server.owns, Some("state.json".to_string()));
         assert_eq!(server.cwd, PathBuf::from("/opt/app"));
     }
 
@@ -163,6 +165,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_directory_attached_process() {
+        let json = r#"{
+            "processes": {
+                "sandbox": {
+                    "command": "commonplace-sync --sandbox --exec ./run.sh",
+                    "cwd": "/home/user/sandbox"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 1);
+
+        let sandbox = &config.processes["sandbox"];
+        assert!(sandbox.owns.is_none());
+        assert_eq!(sandbox.cwd, PathBuf::from("/home/user/sandbox"));
+    }
+
+    #[test]
     fn test_multiple_processes() {
         let json = r#"{
             "processes": {
@@ -183,5 +204,31 @@ mod tests {
         assert_eq!(config.processes.len(), 2);
         assert!(config.processes.contains_key("frontend"));
         assert!(config.processes.contains_key("backend"));
+    }
+
+    #[test]
+    fn test_mixed_file_and_directory_attached() {
+        let json = r#"{
+            "processes": {
+                "counter": {
+                    "command": "python counter.py",
+                    "owns": "counter.json",
+                    "cwd": "/app/counter"
+                },
+                "sandbox": {
+                    "command": "commonplace-sync --sandbox --exec ./run.sh",
+                    "cwd": "/app/sandbox"
+                }
+            }
+        }"#;
+
+        let config = ProcessesConfig::parse(json).unwrap();
+        assert_eq!(config.processes.len(), 2);
+
+        let counter = &config.processes["counter"];
+        assert_eq!(counter.owns, Some("counter.json".to_string()));
+
+        let sandbox = &config.processes["sandbox"];
+        assert!(sandbox.owns.is_none());
     }
 }
