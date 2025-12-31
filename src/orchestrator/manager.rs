@@ -86,6 +86,11 @@ impl ProcessManager {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
 
+        // Set working directory if specified
+        if let Some(ref cwd) = config.cwd {
+            cmd.current_dir(cwd);
+        }
+
         // Add mqtt-broker arg if the process likely needs it
         if config.command.contains("commonplace") {
             cmd.arg("--mqtt-broker");

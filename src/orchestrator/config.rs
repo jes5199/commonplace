@@ -20,6 +20,8 @@ pub struct ProcessConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default)]
