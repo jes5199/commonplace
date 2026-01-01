@@ -9,12 +9,16 @@ use crate::sync::{
     build_head_url, detect_from_path, encode_node_id, is_allowed_extension, is_binary_content,
     spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
 };
+use futures::StreamExt;
 use reqwest::Client;
+use reqwest_eventsource::{Event as SseEvent, EventSource};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
 
 /// Filename for the local schema JSON file in directory sync mode
 pub const SCHEMA_FILENAME: &str = ".commonplace.json";
@@ -362,4 +366,80 @@ pub async fn handle_schema_change(
     }
 
     Ok(())
+}
+
+/// SSE task for directory-level events (watching fs-root).
+///
+/// This task subscribes to the fs-root document's SSE stream and handles
+/// schema change events, triggering handle_schema_change to sync new files.
+pub async fn directory_sse_task(
+    client: Client,
+    server: String,
+    fs_root_id: String,
+    directory: PathBuf,
+    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+) {
+    // fs-root schema subscription always uses ID-based API
+    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
+
+    loop {
+        info!("Connecting to fs-root SSE: {}", sse_url);
+
+        let request_builder = client.get(&sse_url);
+        let mut es = match EventSource::new(request_builder) {
+            Ok(es) => es,
+            Err(e) => {
+                error!("Failed to create fs-root EventSource: {}", e);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(SseEvent::Open) => {
+                    info!("fs-root SSE connection opened");
+                }
+                Ok(SseEvent::Message(msg)) => {
+                    debug!("fs-root SSE event: {} - {}", msg.event, msg.data);
+
+                    match msg.event.as_str() {
+                        "connected" => {
+                            info!("fs-root SSE connected");
+                        }
+                        "edit" => {
+                            // Schema changed on server, sync new files to local
+                            // Spawn tasks for new files discovered during runtime
+                            if let Err(e) = handle_schema_change(
+                                &client,
+                                &server,
+                                &fs_root_id,
+                                &directory,
+                                &file_states,
+                                true, // spawn_tasks: true for runtime schema changes
+                                use_paths,
+                            )
+                            .await
+                            {
+                                warn!("Failed to handle schema change: {}", e);
+                            }
+                        }
+                        "closed" => {
+                            warn!("fs-root SSE: Target node shut down");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    error!("fs-root SSE error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        warn!("fs-root SSE connection closed, reconnecting in 5s...");
+        sleep(Duration::from_secs(5)).await;
+    }
 }

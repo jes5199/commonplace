@@ -8,16 +8,14 @@ use clap::Parser;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
     build_head_url, build_replace_url, build_uuid_map_recursive, detect_from_path,
-    directory_watcher_task, encode_node_id, fetch_node_id_from_schema, file_watcher_task,
-    fork_node, handle_schema_change, initial_sync, is_allowed_extension, is_binary_content,
-    normalize_path, push_file_content, push_json_content, push_schema_to_server, scan_directory,
-    scan_directory_with_contents, schema_to_json, spawn_file_sync_tasks, sse_task, upload_task,
-    write_schema_file, DirEvent, FileEvent, FileSyncState, HeadResponse, ReplaceResponse,
-    ScanOptions, SyncState, SCHEMA_FILENAME,
+    directory_sse_task, directory_watcher_task, encode_node_id, fetch_node_id_from_schema,
+    file_watcher_task, fork_node, handle_schema_change, initial_sync, is_allowed_extension,
+    is_binary_content, normalize_path, push_file_content, push_json_content, push_schema_to_server,
+    scan_directory, scan_directory_with_contents, schema_to_json, spawn_file_sync_tasks, sse_task,
+    upload_task, write_schema_file, DirEvent, FileEvent, FileSyncState, HeadResponse,
+    ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
-use futures::StreamExt;
 use reqwest::Client;
-use reqwest_eventsource::{Event as SseEvent, EventSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1855,77 +1853,4 @@ async fn run_exec_mode(
 
     info!("Goodbye!");
     Ok(exit_code)
-}
-
-/// SSE task for directory-level events (watching fs-root)
-async fn directory_sse_task(
-    client: Client,
-    server: String,
-    fs_root_id: String,
-    directory: PathBuf,
-    file_states: Arc<RwLock<HashMap<String, FileSyncState>>>,
-    use_paths: bool,
-) {
-    // fs-root schema subscription always uses ID-based API
-    let sse_url = format!("{}/sse/docs/{}", server, encode_node_id(&fs_root_id));
-
-    loop {
-        info!("Connecting to fs-root SSE: {}", sse_url);
-
-        let request_builder = client.get(&sse_url);
-        let mut es = match EventSource::new(request_builder) {
-            Ok(es) => es,
-            Err(e) => {
-                error!("Failed to create fs-root EventSource: {}", e);
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        while let Some(event) = es.next().await {
-            match event {
-                Ok(SseEvent::Open) => {
-                    info!("fs-root SSE connection opened");
-                }
-                Ok(SseEvent::Message(msg)) => {
-                    debug!("fs-root SSE event: {} - {}", msg.event, msg.data);
-
-                    match msg.event.as_str() {
-                        "connected" => {
-                            info!("fs-root SSE connected");
-                        }
-                        "edit" => {
-                            // Schema changed on server, sync new files to local
-                            // Spawn tasks for new files discovered during runtime
-                            if let Err(e) = handle_schema_change(
-                                &client,
-                                &server,
-                                &fs_root_id,
-                                &directory,
-                                &file_states,
-                                true, // spawn_tasks: true for runtime schema changes
-                                use_paths,
-                            )
-                            .await
-                            {
-                                warn!("Failed to handle schema change: {}", e);
-                            }
-                        }
-                        "closed" => {
-                            warn!("fs-root SSE: Target node shut down");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                Err(e) => {
-                    error!("fs-root SSE error: {}", e);
-                    break;
-                }
-            }
-        }
-
-        warn!("fs-root SSE connection closed, reconnecting in 5s...");
-        sleep(Duration::from_secs(5)).await;
-    }
 }
