@@ -41,11 +41,13 @@ Links (same UUID = same content):
 
 ## Setup Process
 
-### 1. Create the workspace fs-root
+> **IMPORTANT:** The server MUST be started with `--database` for schema push to work.
+> The linking workflow requires persistence to push local schemas to the server.
+
+### 1. Start the server with persistence
 
 ```bash
-curl -X POST http://localhost:3000/docs -H "Content-Type: application/json" \
-  -d '{"id": "workspace", "content_type": "application/json"}'
+commonplace-server --fs-root workspace --database /path/to/data.redb
 ```
 
 ### 2. Set up the directory structure
@@ -53,14 +55,26 @@ curl -X POST http://localhost:3000/docs -H "Content-Type: application/json" \
 ```bash
 mkdir -p /path/to/workspace/text-to-telegram
 mkdir -p /path/to/workspace/bartleby
+
+# Create initial files
+touch /path/to/workspace/text-to-telegram/content.txt
+touch /path/to/workspace/text-to-telegram/input.txt
+touch /path/to/workspace/bartleby/prompts.txt
+touch /path/to/workspace/bartleby/output.txt
+touch /path/to/workspace/bartleby/system_prompt.txt
 ```
 
-### 3. Start sync for the whole workspace
+### 3. Run initial sync with local strategy
+
+This creates the `.commonplace.json` schema from the local directory structure:
 
 ```bash
 commonplace-sync --directory /path/to/workspace \
-  --node workspace --server http://localhost:3000
+  --node workspace --server http://localhost:3000 \
+  --initial-sync local
 ```
+
+After running, stop the sync (Ctrl-C) before creating links.
 
 ### 4. Create links between sandbox files
 
@@ -70,7 +84,22 @@ commonplace-link text-to-telegram/content.txt bartleby/prompts.txt
 commonplace-link bartleby/output.txt text-to-telegram/input.txt
 ```
 
-### 5. How linking works
+This modifies `.commonplace.json` to give linked files the same UUID.
+
+### 5. Push linked schema and start sync
+
+Run sync again with `--initial-sync local` to push the linked schema:
+
+```bash
+commonplace-sync --directory /path/to/workspace \
+  --node workspace --server http://localhost:3000 \
+  --initial-sync local
+```
+
+> **CRITICAL:** You MUST use `--initial-sync local` after creating links to push
+> the updated schema to the server. Otherwise, the server won't use your linked UUIDs.
+
+### 6. How linking works
 
 When `commonplace-link A B` is run:
 1. Gets or creates a UUID for file A
@@ -125,3 +154,4 @@ Processes only see their own subdirectory but share content via linked files.
 - CP-2pr: Sync refactoring (completed)
 - CP-g0c: Schema corruption fix (completed)
 - CP-8vr: Sync race condition with shared UUIDs (completed)
+- CP-jrc: Preserve local schema during sync (completed)
