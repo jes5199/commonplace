@@ -10,6 +10,9 @@ use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+#[allow(unused_imports)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -127,8 +130,9 @@ impl DiscoveredProcessManager {
                 #[cfg(unix)]
                 {
                     if let Some(pid) = child.id() {
+                        // Kill the entire process group
                         unsafe {
-                            libc::kill(pid as i32, libc::SIGTERM);
+                            libc::killpg(pid as i32, libc::SIGTERM);
                         }
                     }
                 }
@@ -136,6 +140,13 @@ impl DiscoveredProcessManager {
                 let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
 
                 if timeout.is_err() {
+                    // Force kill the entire process group
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGKILL);
+                        }
+                    }
                     let _ = child.kill().await;
                 }
             }
@@ -221,6 +232,23 @@ impl DiscoveredProcessManager {
         // Capture stdout/stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // Enable kill_on_drop for extra safety when handle is dropped
+        cmd.kill_on_drop(true);
+
+        // Set up process group on Unix (works on macOS and Linux)
+        // Also set death signal on Linux (prctl is Linux-specific)
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Put child in its own process group so we can kill all descendants
+                libc::setpgid(0, 0);
+                // Request SIGTERM if parent dies (Linux-only, covers SIGKILL of parent)
+                #[cfg(target_os = "linux")]
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
 
         let mut child = cmd
             .spawn()
@@ -987,8 +1015,10 @@ impl DiscoveredProcessManager {
                     #[cfg(unix)]
                     {
                         if let Some(pid) = child.id() {
+                            // Kill the entire process group (negative pid)
+                            // This ensures all descendants are terminated
                             unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
+                                libc::killpg(pid as i32, libc::SIGTERM);
                             }
                         }
                     }
@@ -1001,9 +1031,16 @@ impl DiscoveredProcessManager {
                         }
                         _ => {
                             tracing::warn!(
-                                "[discovery] '{}' didn't stop gracefully, killing",
+                                "[discovery] '{}' didn't stop gracefully, force killing process group",
                                 name
                             );
+                            // Force kill the entire process group
+                            #[cfg(unix)]
+                            if let Some(pid) = child.id() {
+                                unsafe {
+                                    libc::killpg(pid as i32, libc::SIGKILL);
+                                }
+                            }
                             let _ = child.kill().await;
                         }
                     }

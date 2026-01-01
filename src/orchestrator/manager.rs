@@ -1,5 +1,8 @@
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
+#[cfg(unix)]
+#[allow(unused_imports)]
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -100,6 +103,23 @@ impl ProcessManager {
         // Capture stdout/stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // Enable kill_on_drop for extra safety when handle is dropped
+        cmd.kill_on_drop(true);
+
+        // Set up process group on Unix (works on macOS and Linux)
+        // Also set death signal on Linux (prctl is Linux-specific)
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Put child in its own process group so we can kill all descendants
+                libc::setpgid(0, 0);
+                // Request SIGTERM if parent dies (Linux-only, covers SIGKILL of parent)
+                #[cfg(target_os = "linux")]
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
 
         tracing::info!("[orchestrator] Starting process: {}", name);
 
@@ -369,8 +389,10 @@ impl ProcessManager {
                     #[cfg(unix)]
                     {
                         if let Some(pid) = child.id() {
+                            // Kill the entire process group (negative pid)
+                            // This ensures all descendants are terminated
                             unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
+                                libc::killpg(pid as i32, libc::SIGTERM);
                             }
                         }
                     }
@@ -383,9 +405,16 @@ impl ProcessManager {
                         }
                         _ => {
                             tracing::warn!(
-                                "[orchestrator] '{}' didn't stop gracefully, killing",
+                                "[orchestrator] '{}' didn't stop gracefully, force killing process group",
                                 name
                             );
+                            // Force kill the entire process group
+                            #[cfg(unix)]
+                            if let Some(pid) = child.id() {
+                                unsafe {
+                                    libc::killpg(pid as i32, libc::SIGKILL);
+                                }
+                            }
                             let _ = child.kill().await;
                         }
                     }
