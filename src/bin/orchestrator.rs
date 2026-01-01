@@ -8,8 +8,38 @@ use commonplace_doc::cli::OrchestratorArgs;
 use commonplace_doc::orchestrator::{DiscoveredProcessManager, OrchestratorConfig, ProcessManager};
 use std::net::TcpStream;
 use std::time::Duration;
+#[cfg(not(unix))]
 use tokio::signal;
+#[cfg(unix)]
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Wait for either SIGINT (Ctrl+C) or SIGTERM.
+/// Returns when either signal is received.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigint =
+        unix_signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+    let mut sigterm =
+        unix_signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            tracing::info!("[orchestrator] Received SIGINT (Ctrl+C)");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("[orchestrator] Received SIGTERM");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    signal::ctrl_c()
+        .await
+        .expect("Failed to register Ctrl+C handler");
+    tracing::info!("[orchestrator] Received Ctrl+C");
+}
 
 #[tokio::main]
 async fn main() {
@@ -116,15 +146,6 @@ async fn main() {
 
         tracing::info!("[orchestrator] Using fs-root: {}", fs_root_id);
 
-        // Create shutdown signal
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            let _ = signal::ctrl_c().await;
-            tracing::info!("[orchestrator] Received Ctrl+C");
-            let _ = shutdown_tx.send(());
-        });
-
         // Run the recursive watcher with shutdown handling
         tokio::select! {
             result = discovered_manager.run_with_recursive_watch(&client, &fs_root_id) => {
@@ -132,7 +153,7 @@ async fn main() {
                     tracing::error!("[orchestrator] Recursive watch failed: {}", e);
                 }
             }
-            _ = shutdown_rx => {
+            _ = wait_for_shutdown_signal() => {
                 tracing::info!("[orchestrator] Shutting down...");
             }
         }
@@ -151,15 +172,6 @@ async fn main() {
 
         let client = reqwest::Client::new();
 
-        // Create shutdown signal
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            let _ = signal::ctrl_c().await;
-            tracing::info!("[orchestrator] Received Ctrl+C");
-            let _ = shutdown_tx.send(());
-        });
-
         // Run the document watcher with shutdown handling
         tokio::select! {
             result = discovered_manager.run_with_document_watch(&client, doc_path, args.use_paths) => {
@@ -167,7 +179,7 @@ async fn main() {
                     tracing::error!("[orchestrator] Document watch failed: {}", e);
                 }
             }
-            _ = shutdown_rx => {
+            _ = wait_for_shutdown_signal() => {
                 tracing::info!("[orchestrator] Shutting down...");
             }
         }
@@ -185,22 +197,14 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Create shutdown signal for --only mode
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            let _ = signal::ctrl_c().await;
-            tracing::info!("[orchestrator] Received Ctrl+C");
-            let _ = shutdown_tx.send(());
-        });
-
-        // Monitor the single process with restart support
+        // Monitor the single process with restart support until shutdown signal
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => {
+                _ = wait_for_shutdown_signal() => {
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                _ = monitor_interval.tick() => {
                     manager.check_and_restart().await;
                 }
             }
@@ -214,23 +218,14 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Create a shutdown signal
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        // Spawn Ctrl+C handler
-        tokio::spawn(async move {
-            let _ = signal::ctrl_c().await;
-            tracing::info!("[orchestrator] Received Ctrl+C");
-            let _ = shutdown_tx.send(());
-        });
-
-        // Run monitoring loop until shutdown
+        // Run monitoring loop until shutdown signal
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => {
+                _ = wait_for_shutdown_signal() => {
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                _ = monitor_interval.tick() => {
                     // Check for exited processes and restart if needed
                     manager.check_and_restart().await;
                 }
