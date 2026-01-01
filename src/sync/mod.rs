@@ -14,6 +14,10 @@ pub mod watcher;
 pub mod yjs;
 
 pub use client::{fork_node, push_file_content, push_json_content, push_schema_to_server};
+pub use dir_sync::{
+    build_uuid_map_from_doc, build_uuid_map_recursive, collect_paths_from_entry,
+    collect_paths_with_node_backed_dirs, fetch_node_id_from_schema,
+};
 pub use file_sync::{upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY};
 
 pub use content_type::{
@@ -26,8 +30,8 @@ pub use directory::{
 pub use sse::{handle_server_edit, refresh_from_head, sse_task, PENDING_WRITE_TIMEOUT};
 pub use state::{PendingWrite, SyncState};
 pub use types::{
-    CommitData, DirEvent, EditEventData, EditRequest, EditResponse, FileEvent, ForkResponse,
-    HeadResponse, ReplaceResponse, ReplaceSummary,
+    CommitData, DirEvent, EditEventData, EditRequest, EditResponse, FileEvent, FileSyncState,
+    ForkResponse, HeadResponse, ReplaceResponse, ReplaceSummary,
 };
 pub use urls::{
     build_edit_url, build_fork_url, build_head_url, build_replace_url, build_sse_url,
