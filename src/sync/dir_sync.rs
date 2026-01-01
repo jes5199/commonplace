@@ -695,6 +695,54 @@ pub async fn handle_file_modified(
     }
 }
 
+/// Ensure fs-root document exists on the server, creating it if necessary.
+///
+/// Returns Ok(()) if the document exists or was created successfully.
+pub async fn ensure_fs_root_exists(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(fs_root_id));
+    let resp = client.get(&doc_url).send().await?;
+    if !resp.status().is_success() {
+        // Create the document
+        info!("Creating fs-root document: {}", fs_root_id);
+        let create_url = format!("{}/docs", server);
+        let create_resp = client
+            .post(&create_url)
+            .json(&serde_json::json!({
+                "type": "document",
+                "id": fs_root_id,
+                "content_type": "application/json"
+            }))
+            .send()
+            .await?;
+        if !create_resp.status().is_success() {
+            let status = create_resp.status();
+            let body = create_resp.text().await.unwrap_or_default();
+            return Err(format!("Failed to create fs-root document: {} - {}", status, body).into());
+        }
+    }
+    info!("Connected to fs-root document: {}", fs_root_id);
+    Ok(())
+}
+
+/// Check if the server has existing schema content.
+///
+/// Returns true if the server has non-empty, non-trivial content.
+pub async fn check_server_has_content(client: &Client, server: &str, fs_root_id: &str) -> bool {
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(fs_root_id));
+    if let Ok(resp) = client.get(&head_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(head) = resp.json::<HeadResponse>().await {
+                return !head.content.is_empty() && head.content != "{}";
+            }
+        }
+    }
+    false
+}
+
 /// Handle a file deletion event in directory sync mode.
 ///
 /// Stops sync tasks for the deleted file and updates the schema.

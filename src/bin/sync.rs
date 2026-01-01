@@ -7,13 +7,14 @@
 use clap::Parser;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
-    build_head_url, build_replace_url, build_uuid_map_recursive, detect_from_path,
-    directory_sse_task, directory_watcher_task, encode_node_id, file_watcher_task, fork_node,
-    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    initial_sync, is_binary_content, push_file_content, push_json_content, push_schema_to_server,
-    scan_directory, scan_directory_with_contents, schema_to_json, spawn_file_sync_tasks, sse_task,
-    upload_task, write_schema_file, DirEvent, FileEvent, FileSyncState, HeadResponse,
-    ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
+    build_head_url, build_replace_url, build_uuid_map_recursive, check_server_has_content,
+    detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
+    ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created, handle_file_deleted,
+    handle_file_modified, handle_schema_change, initial_sync, is_binary_content, push_file_content,
+    push_json_content, push_schema_to_server, scan_directory, scan_directory_with_contents,
+    schema_to_json, spawn_file_sync_tasks, sse_task, upload_task, write_schema_file, DirEvent,
+    FileEvent, FileSyncState, HeadResponse, ReplaceResponse, ScanOptions, SyncState,
+    SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -438,38 +439,10 @@ async fn run_directory_mode(
     }
 
     // Verify fs-root document exists (or create it)
-    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&fs_root_id));
-    let resp = client.get(&doc_url).send().await?;
-    if !resp.status().is_success() {
-        // Create the document
-        info!("Creating fs-root document: {}", fs_root_id);
-        let create_url = format!("{}/docs", server);
-        let create_resp = client
-            .post(&create_url)
-            .json(&serde_json::json!({
-                "type": "document",
-                "id": fs_root_id,
-                "content_type": "application/json"
-            }))
-            .send()
-            .await?;
-        if !create_resp.status().is_success() {
-            let status = create_resp.status();
-            let body = create_resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to create fs-root document: {} - {}", status, body).into());
-        }
-    }
-    info!("Connected to fs-root document: {}", fs_root_id);
+    ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
 
-    // Check if server has existing schema FIRST (needed for server strategy)
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
-    let head_resp = client.get(&head_url).send().await?;
-    let server_has_content = if head_resp.status().is_success() {
-        let head: HeadResponse = head_resp.json().await?;
-        !head.content.is_empty() && head.content != "{}"
-    } else {
-        false
-    };
+    // Check if server has existing schema
+    let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
 
     // If strategy is "server" and server has content, pull server files first
     // This creates the temporary file_states that handle_schema_change needs
@@ -881,38 +854,10 @@ async fn run_exec_mode(
     }
 
     // Verify fs-root document exists (or create it)
-    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&fs_root_id));
-    let resp = client.get(&doc_url).send().await?;
-    if !resp.status().is_success() {
-        // Create the document
-        info!("Creating fs-root document: {}", fs_root_id);
-        let create_url = format!("{}/docs", server);
-        let create_resp = client
-            .post(&create_url)
-            .json(&serde_json::json!({
-                "type": "document",
-                "id": fs_root_id,
-                "content_type": "application/json"
-            }))
-            .send()
-            .await?;
-        if !create_resp.status().is_success() {
-            let status = create_resp.status();
-            let body = create_resp.text().await.unwrap_or_default();
-            return Err(format!("Failed to create fs-root document: {} - {}", status, body).into());
-        }
-    }
-    info!("Connected to fs-root document: {}", fs_root_id);
+    ensure_fs_root_exists(&client, &server, &fs_root_id).await?;
 
-    // Check if server has existing schema FIRST (needed for server strategy)
-    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&fs_root_id));
-    let head_resp = client.get(&head_url).send().await?;
-    let server_has_content = if head_resp.status().is_success() {
-        let head: HeadResponse = head_resp.json().await?;
-        !head.content.is_empty() && head.content != "{}"
-    } else {
-        false
-    };
+    // Check if server has existing schema
+    let server_has_content = check_server_has_content(&client, &server, &fs_root_id).await;
 
     // If strategy is "server" and server has content, pull server files first
     let file_states: Arc<RwLock<HashMap<String, FileSyncState>>> =
