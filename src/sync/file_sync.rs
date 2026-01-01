@@ -481,6 +481,175 @@ pub async fn initial_sync(
     Ok(())
 }
 
+/// Sync a single file during initial directory sync.
+///
+/// Handles determining the identifier (path or UUID), checking server content,
+/// and pushing/pulling content based on strategy.
+///
+/// Returns the final identifier used and the content hash.
+pub async fn sync_single_file(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    file: &crate::sync::directory::ScannedFile,
+    file_path: &std::path::PathBuf,
+    uuid_map: &std::collections::HashMap<String, String>,
+    initial_sync_strategy: &str,
+    file_states: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, crate::sync::FileSyncState>>,
+    >,
+    use_paths: bool,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    // Determine identifier
+    let identifier = if use_paths {
+        file.relative_path.clone()
+    } else if let Some(uuid) = uuid_map.get(&file.relative_path) {
+        info!("Using UUID for {}: {}", file.relative_path, uuid);
+        uuid.clone()
+    } else {
+        let derived = format!("{}:{}", fs_root_id, file.relative_path);
+        warn!(
+            "No UUID found for {}, using derived ID: {}",
+            file.relative_path, derived
+        );
+        derived
+    };
+    info!("Syncing file: {} -> {}", file.relative_path, identifier);
+
+    // Reuse existing state if handle_schema_change already created one
+    let state = {
+        let states = file_states.read().await;
+        if let Some(existing) = states.get(&file.relative_path) {
+            existing.state.clone()
+        } else {
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::sync::SyncState::new()))
+        }
+    };
+
+    // Check server state
+    let file_head_url = crate::sync::build_head_url(server, &identifier, use_paths);
+    let file_head_resp = client.get(&file_head_url).send().await;
+
+    if let Ok(resp) = file_head_resp {
+        debug!(
+            "File head response status: {} for {}",
+            resp.status(),
+            identifier
+        );
+        if resp.status().is_success() {
+            let head: crate::sync::HeadResponse = resp.json().await?;
+            info!(
+                "File head content empty: {}, strategy: {}",
+                head.content.is_empty(),
+                initial_sync_strategy
+            );
+            if head.content.is_empty() || initial_sync_strategy == "local" {
+                // Push local content
+                info!(
+                    "Pushing initial content for: {} ({} bytes)",
+                    identifier,
+                    file.content.len()
+                );
+                if !file.is_binary && file.content_type.starts_with("application/json") {
+                    crate::sync::push_json_content(
+                        client,
+                        server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
+                } else {
+                    crate::sync::push_file_content(
+                        client,
+                        server,
+                        &identifier,
+                        &file.content,
+                        &state,
+                        use_paths,
+                    )
+                    .await?;
+                }
+            } else {
+                // Server has content
+                if initial_sync_strategy == "server" {
+                    // Pull server content to local
+                    if file.is_binary {
+                        if let Ok(decoded) = STANDARD.decode(&head.content) {
+                            tokio::fs::write(file_path, &decoded).await?;
+                        }
+                    } else {
+                        tokio::fs::write(file_path, &head.content).await?;
+                    }
+                }
+                // Seed SyncState
+                let mut s = state.write().await;
+                s.last_written_cid = head.cid;
+                if initial_sync_strategy == "skip" {
+                    s.last_written_content = file.content.clone();
+                } else {
+                    s.last_written_content = head.content;
+                }
+            }
+        } else {
+            // Node doesn't exist yet - push content
+            info!("Node not ready, will push with retries for: {}", identifier);
+            if !file.is_binary && file.content_type.starts_with("application/json") {
+                crate::sync::push_json_content(
+                    client,
+                    server,
+                    &identifier,
+                    &file.content,
+                    &state,
+                    use_paths,
+                )
+                .await?;
+            } else {
+                crate::sync::push_file_content(
+                    client,
+                    server,
+                    &identifier,
+                    &file.content,
+                    &state,
+                    use_paths,
+                )
+                .await?;
+            }
+        }
+    }
+
+    // Compute content hash
+    let content_hash = if file.is_binary {
+        match STANDARD.decode(&file.content) {
+            Ok(raw_bytes) => compute_content_hash(&raw_bytes),
+            Err(_) => compute_content_hash(file.content.as_bytes()),
+        }
+    } else {
+        compute_content_hash(file.content.as_bytes())
+    };
+
+    // Store state for this file
+    {
+        let mut states = file_states.write().await;
+        states.insert(
+            file.relative_path.clone(),
+            crate::sync::FileSyncState {
+                relative_path: file.relative_path.clone(),
+                identifier: identifier.clone(),
+                state,
+                task_handles: Vec::new(),
+                use_paths,
+                content_hash: Some(content_hash.clone()),
+            },
+        );
+    }
+
+    Ok((identifier, content_hash))
+}
+
 /// Spawn sync tasks (watcher, upload, SSE) for a single file.
 /// Returns the task handles so they can be aborted on file deletion.
 pub fn spawn_file_sync_tasks(

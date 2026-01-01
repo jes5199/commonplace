@@ -21,7 +21,8 @@ pub use dir_sync::{
     handle_file_modified, handle_schema_change, sync_schema, write_schema_file, SCHEMA_FILENAME,
 };
 pub use file_sync::{
-    initial_sync, spawn_file_sync_tasks, upload_task, BARRIER_RETRY_COUNT, BARRIER_RETRY_DELAY,
+    initial_sync, spawn_file_sync_tasks, sync_single_file, upload_task, BARRIER_RETRY_COUNT,
+    BARRIER_RETRY_DELAY,
 };
 
 pub use content_type::{

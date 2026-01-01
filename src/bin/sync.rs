@@ -7,13 +7,12 @@
 use clap::Parser;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
-    build_head_url, build_replace_url, build_uuid_map_recursive, check_server_has_content,
-    detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
-    ensure_fs_root_exists, file_watcher_task, fork_node, handle_file_created, handle_file_deleted,
-    handle_file_modified, handle_schema_change, initial_sync, is_binary_content, push_file_content,
-    push_json_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task, sync_schema,
-    upload_task, DirEvent, FileEvent, FileSyncState, HeadResponse, ReplaceResponse, ScanOptions,
-    SyncState, SCHEMA_FILENAME,
+    build_replace_url, build_uuid_map_recursive, check_server_has_content, detect_from_path,
+    directory_sse_task, directory_watcher_task, encode_node_id, ensure_fs_root_exists,
+    file_watcher_task, fork_node, handle_file_created, handle_file_deleted, handle_file_modified,
+    handle_schema_change, initial_sync, is_binary_content, scan_directory_with_contents,
+    spawn_file_sync_tasks, sse_task, sync_schema, sync_single_file, upload_task, DirEvent,
+    FileEvent, FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -501,172 +500,23 @@ async fn run_directory_mode(
         std::collections::HashMap::new()
     };
 
-    // Sync each file (file_states was created earlier for server-first pull)
+    // Sync each file
     for file in &files {
-        // When use_paths=true, use relative path directly for /files/* endpoints
-        // When use_paths=false, use UUID from schema if available, otherwise derive as fs_root_id:path
-        let identifier = if use_paths {
-            file.relative_path.clone()
-        } else if let Some(uuid) = uuid_map.get(&file.relative_path) {
-            info!("Using UUID for {}: {}", file.relative_path, uuid);
-            uuid.clone()
-        } else {
-            let derived = format!("{}:{}", fs_root_id, file.relative_path);
-            warn!(
-                "No UUID found for {}, using derived ID: {}",
-                file.relative_path, derived
-            );
-            derived
-        };
-        info!("Syncing file: {} -> {}", file.relative_path, identifier);
-
         let file_path = directory.join(&file.relative_path);
-
-        // Reuse existing state if handle_schema_change already created one (server-first sync)
-        // Otherwise create a new state
-        let state = {
-            let states = file_states.read().await;
-            if let Some(existing) = states.get(&file.relative_path) {
-                existing.state.clone()
-            } else {
-                Arc::new(RwLock::new(SyncState::new()))
-            }
-        };
-
-        // Push initial content if local wins or server is empty
-        let file_head_url = build_head_url(&server, &identifier, use_paths);
-        let file_head_resp = client.get(&file_head_url).send().await;
-
-        let should_push_content = match &file_head_resp {
-            Ok(resp) if resp.status().is_success() => {
-                // Check if server has content
-                false // Will be handled below after parsing
-            }
-            _ => true, // Node doesn't exist yet or error
-        };
-
-        if let Ok(resp) = file_head_resp {
-            debug!(
-                "File head response status: {} for {}",
-                resp.status(),
-                identifier
-            );
-            if resp.status().is_success() {
-                let head: HeadResponse = resp.json().await?;
-                info!(
-                    "File head content empty: {}, strategy: {}",
-                    head.content.is_empty(),
-                    initial_sync_strategy
-                );
-                if head.content.is_empty() || initial_sync_strategy == "local" {
-                    // Push local content (binary files are already base64 encoded)
-                    info!(
-                        "Pushing initial content for: {} ({} bytes)",
-                        identifier,
-                        file.content.len()
-                    );
-                    if !file.is_binary && file.content_type.starts_with("application/json") {
-                        push_json_content(
-                            &client,
-                            &server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    } else {
-                        push_file_content(
-                            &client,
-                            &server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    }
-                } else {
-                    // Server has content
-                    if initial_sync_strategy == "server" {
-                        // Pull server content to local
-                        // For binary files, decode base64; for text, use as-is
-                        if file.is_binary {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
-                            if let Ok(decoded) = STANDARD.decode(&head.content) {
-                                tokio::fs::write(&file_path, &decoded).await?;
-                            }
-                        } else {
-                            tokio::fs::write(&file_path, &head.content).await?;
-                        }
-                    }
-                    // Seed SyncState so SSE updates work and uploads use correct parent CID
-                    // For "skip" strategy: use local content for last_written_content so
-                    // server edits aren't blocked (we didn't modify local, so local IS
-                    // what's "last written"). For "server" strategy: we wrote server
-                    // content to local, so use server content as last_written.
-                    let mut s = state.write().await;
-                    s.last_written_cid = head.cid;
-                    if initial_sync_strategy == "skip" {
-                        // Local file unchanged, so last_written matches local content
-                        s.last_written_content = file.content.clone();
-                    } else {
-                        // Server content was written to local
-                        s.last_written_content = head.content;
-                    }
-                }
-            } else if should_push_content {
-                // Node doesn't exist yet or returned non-success - push content with retries
-                info!("Node not ready, will push with retries for: {}", identifier);
-                if !file.is_binary && file.content_type.starts_with("application/json") {
-                    push_json_content(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                } else {
-                    push_file_content(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        // Store state for this file (tasks will be spawned after initial sync)
+        if let Err(e) = sync_single_file(
+            &client,
+            &server,
+            &fs_root_id,
+            file,
+            &file_path,
+            &uuid_map,
+            &initial_sync_strategy,
+            &file_states,
+            use_paths,
+        )
+        .await
         {
-            // For binary files, decode base64 to get raw bytes for consistent hashing
-            // New file detection hashes raw bytes, so we must do the same here
-            let content_hash = if file.is_binary {
-                use base64::{engine::general_purpose::STANDARD, Engine};
-                match STANDARD.decode(&file.content) {
-                    Ok(raw_bytes) => compute_content_hash(&raw_bytes),
-                    Err(_) => compute_content_hash(file.content.as_bytes()),
-                }
-            } else {
-                compute_content_hash(file.content.as_bytes())
-            };
-            let mut states = file_states.write().await;
-            states.insert(
-                file.relative_path.clone(),
-                FileSyncState {
-                    relative_path: file.relative_path.clone(),
-                    identifier: identifier.clone(),
-                    state,
-                    task_handles: Vec::new(), // Will be populated after initial sync
-                    use_paths,
-                    content_hash: Some(content_hash),
-                },
-            );
+            warn!("Failed to sync file {}: {}", file.relative_path, e);
         }
     }
 
@@ -880,137 +730,23 @@ async fn run_exec_mode(
         std::collections::HashMap::new()
     };
 
+    // Sync each file
     for file in &files {
-        // When use_paths=true, use relative path directly for /files/* endpoints
-        // When use_paths=false, use UUID from schema if available, otherwise derive as fs_root_id:path
-        let identifier = if use_paths {
-            file.relative_path.clone()
-        } else if let Some(uuid) = uuid_map.get(&file.relative_path) {
-            info!("Using UUID for {}: {}", file.relative_path, uuid);
-            uuid.clone()
-        } else {
-            let derived = format!("{}:{}", fs_root_id, file.relative_path);
-            warn!(
-                "No UUID found for {}, using derived ID: {}",
-                file.relative_path, derived
-            );
-            derived
-        };
-        info!("Syncing file: {} -> {}", file.relative_path, identifier);
-
         let file_path = directory.join(&file.relative_path);
-
-        let state = {
-            let states = file_states.read().await;
-            if let Some(existing) = states.get(&file.relative_path) {
-                existing.state.clone()
-            } else {
-                Arc::new(RwLock::new(SyncState::new()))
-            }
-        };
-
-        let file_head_url = build_head_url(&server, &identifier, use_paths);
-        let file_head_resp = client.get(&file_head_url).send().await;
-
-        if let Ok(resp) = file_head_resp {
-            if resp.status().is_success() {
-                let head: HeadResponse = resp.json().await?;
-                if head.content.is_empty() || initial_sync_strategy == "local" {
-                    info!(
-                        "Pushing initial content for: {} ({} bytes)",
-                        identifier,
-                        file.content.len()
-                    );
-                    if !file.is_binary && file.content_type.starts_with("application/json") {
-                        push_json_content(
-                            &client,
-                            &server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    } else {
-                        push_file_content(
-                            &client,
-                            &server,
-                            &identifier,
-                            &file.content,
-                            &state,
-                            use_paths,
-                        )
-                        .await?;
-                    }
-                } else {
-                    if initial_sync_strategy == "server" {
-                        if file.is_binary {
-                            use base64::{engine::general_purpose::STANDARD, Engine};
-                            if let Ok(decoded) = STANDARD.decode(&head.content) {
-                                tokio::fs::write(&file_path, &decoded).await?;
-                            }
-                        } else {
-                            tokio::fs::write(&file_path, &head.content).await?;
-                        }
-                    }
-                    let mut s = state.write().await;
-                    s.last_written_cid = head.cid;
-                    if initial_sync_strategy == "skip" {
-                        s.last_written_content = file.content.clone();
-                    } else {
-                        s.last_written_content = head.content;
-                    }
-                }
-            } else {
-                info!("Node not ready, will push with retries for: {}", identifier);
-                if !file.is_binary && file.content_type.starts_with("application/json") {
-                    push_json_content(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                } else {
-                    push_file_content(
-                        &client,
-                        &server,
-                        &identifier,
-                        &file.content,
-                        &state,
-                        use_paths,
-                    )
-                    .await?;
-                }
-            }
-        }
-
+        if let Err(e) = sync_single_file(
+            &client,
+            &server,
+            &fs_root_id,
+            file,
+            &file_path,
+            &uuid_map,
+            &initial_sync_strategy,
+            &file_states,
+            use_paths,
+        )
+        .await
         {
-            // For binary files, decode base64 to get raw bytes for consistent hashing
-            // New file detection hashes raw bytes, so we must do the same here
-            let content_hash = if file.is_binary {
-                use base64::{engine::general_purpose::STANDARD, Engine};
-                match STANDARD.decode(&file.content) {
-                    Ok(raw_bytes) => compute_content_hash(&raw_bytes),
-                    Err(_) => compute_content_hash(file.content.as_bytes()),
-                }
-            } else {
-                compute_content_hash(file.content.as_bytes())
-            };
-            let mut states = file_states.write().await;
-            states.insert(
-                file.relative_path.clone(),
-                FileSyncState {
-                    relative_path: file.relative_path.clone(),
-                    identifier: identifier.clone(),
-                    state,
-                    task_handles: Vec::new(),
-                    use_paths,
-                    content_hash: Some(content_hash),
-                },
-            );
+            warn!("Failed to sync file {}: {}", file.relative_path, e);
         }
     }
 
