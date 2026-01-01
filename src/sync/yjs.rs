@@ -532,4 +532,179 @@ mod tests {
             );
         }
     }
+
+    mod ymap_roundtrip {
+        use super::*;
+        use yrs::types::ToJson;
+
+        /// Test that simulates the exact server-sync flow for JSON documents:
+        /// 1. Server creates a Y.Map document (like fs-root with ContentType::Json)
+        /// 2. Server sends its initial state to sync client
+        /// 3. Sync creates update with nested JSON (using create_yjs_json_update)
+        /// 4. Server applies the update
+        /// 5. Server reads back the content - should be valid nested JSON
+        #[test]
+        fn test_ymap_server_sync_roundtrip() {
+            // Step 1: Server creates document with Y.Map at "content" (like ContentType::Json)
+            let server_doc = Doc::with_client_id(0);
+            {
+                let mut txn = server_doc.transact_mut();
+                txn.get_or_insert_map(TEXT_ROOT_NAME);
+            }
+
+            // Step 2: Server's initial state (sent to sync client)
+            let server_state = {
+                let txn = server_doc.transact();
+                txn.encode_state_as_update_v1(&yrs::StateVector::default())
+            };
+            let server_state_b64 = base64_encode(&server_state);
+
+            // Step 3: Sync creates update with nested JSON
+            let nested_json = r#"{"version":1,"root":{"type":"dir","entries":{"test.txt":{"type":"doc","node_id":"abc-123"}}}}"#;
+            let sync_update_b64 = create_yjs_json_update(nested_json, Some(&server_state_b64))
+                .expect("Should create update");
+            let sync_update = base64_decode(&sync_update_b64).expect("Should decode");
+
+            // Step 4: Server applies the update
+            {
+                let update = Update::decode_v1(&sync_update).expect("Should decode update");
+                let mut txn = server_doc.transact_mut();
+                txn.apply_update(update);
+            }
+
+            // Step 5: Server reads back content (like document.rs does for ContentType::Json)
+            let content = {
+                let txn = server_doc.transact();
+                let root = txn
+                    .root_refs()
+                    .find(|(name, _)| *name == TEXT_ROOT_NAME)
+                    .map(|(_, value)| value);
+
+                match root {
+                    Some(yrs::types::Value::YMap(map)) => {
+                        let any = map.to_json(&txn);
+                        serde_json::to_string(&any).expect("Should serialize")
+                    }
+                    other => panic!("Expected YMap, got {:?}", other),
+                }
+            };
+
+            // Verify the content is valid JSON with nested structure
+            let parsed: serde_json::Value =
+                serde_json::from_str(&content).expect("Content should be valid JSON");
+
+            // Check structure
+            assert_eq!(parsed["version"], 1);
+            assert!(
+                parsed["root"].is_object(),
+                "root should be an object, not a string"
+            );
+            assert_eq!(parsed["root"]["type"], "dir");
+            assert!(parsed["root"]["entries"].is_object());
+            assert_eq!(parsed["root"]["entries"]["test.txt"]["node_id"], "abc-123");
+        }
+
+        /// Test that nested Any::Map values are preserved through the update cycle
+        #[test]
+        fn test_nested_any_map_preserved() {
+            let doc1 = Doc::with_client_id(1);
+            let doc2 = Doc::with_client_id(2);
+
+            // Insert nested structure into doc1
+            let update1 = {
+                let mut txn = doc1.transact_mut();
+                let map = txn.get_or_insert_map(TEXT_ROOT_NAME);
+
+                // Create nested object
+                let nested: serde_json::Value = serde_json::json!({
+                    "level1": {
+                        "level2": {
+                            "value": "deep"
+                        }
+                    }
+                });
+
+                if let serde_json::Value::Object(obj) = nested {
+                    for (key, val) in obj {
+                        let any_val = json_value_to_any(val);
+                        map.insert(&mut txn, key.as_str(), any_val);
+                    }
+                }
+
+                txn.encode_update_v1()
+            };
+
+            // Apply to doc2
+            {
+                let update = Update::decode_v1(&update1).expect("decode");
+                let mut txn = doc2.transact_mut();
+                txn.apply_update(update);
+            }
+
+            // Read from doc2
+            let content = {
+                let txn = doc2.transact();
+                let map = txn.get_map(TEXT_ROOT_NAME).expect("map exists");
+                let any = map.to_json(&txn);
+                serde_json::to_string(&any).expect("serialize")
+            };
+
+            let parsed: serde_json::Value = serde_json::from_str(&content).expect("parse");
+            assert!(parsed["level1"].is_object(), "level1 should be object");
+            assert!(
+                parsed["level1"]["level2"].is_object(),
+                "level2 should be object"
+            );
+            assert_eq!(parsed["level1"]["level2"]["value"], "deep");
+        }
+
+        /// Test that node_id values survive the Yjs roundtrip
+        #[test]
+        fn test_node_id_preserved_in_yjs() {
+            // Schema with explicit node_id (this is what sync client pushes)
+            let schema_json = r#"{"version":1,"root":{"type":"dir","entries":{"hello.txt":{"type":"doc","node_id":"MY-EXPLICIT-NODE-ID-123","content_type":"text/plain"}}}}"#;
+
+            // Simulate server document with empty Y.Map
+            let server_doc = Doc::with_client_id(0);
+            {
+                let mut txn = server_doc.transact_mut();
+                txn.get_or_insert_map(TEXT_ROOT_NAME);
+            }
+
+            let server_state = {
+                let txn = server_doc.transact();
+                txn.encode_state_as_update_v1(&yrs::StateVector::default())
+            };
+            let server_state_b64 = base64_encode(&server_state);
+
+            // Create update using the sync client's function
+            let update_b64 = create_yjs_json_update(schema_json, Some(&server_state_b64))
+                .expect("Should create update");
+            let update = base64_decode(&update_b64).expect("decode");
+
+            // Apply update to server doc (simulating what server does)
+            {
+                let update = Update::decode_v1(&update).expect("decode update");
+                let mut txn = server_doc.transact_mut();
+                txn.apply_update(update);
+            }
+
+            // Read result from Y.Map (what server returns)
+            let txn = server_doc.transact();
+            let content_map = txn.get_map(TEXT_ROOT_NAME).expect("map exists");
+            let content_any = content_map.to_json(&txn);
+
+            // Convert to JSON and verify node_id is preserved
+            let json_str = serde_json::to_string(&content_any).expect("serialize");
+            let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parse");
+
+            // Navigate to hello.txt and check node_id
+            let node_id = &parsed["root"]["entries"]["hello.txt"]["node_id"];
+            assert_eq!(
+                node_id, "MY-EXPLICIT-NODE-ID-123",
+                "node_id should be preserved after Yjs roundtrip, got: {}",
+                node_id
+            );
+        }
+    }
 }
