@@ -7,7 +7,19 @@ use crate::fs::{Entry, FsSchema};
 use crate::sync::{encode_node_id, HeadResponse};
 use reqwest::Client;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use std::path::Path;
+use tracing::{debug, info, warn};
+
+/// Filename for the local schema JSON file in directory sync mode
+pub const SCHEMA_FILENAME: &str = ".commonplace.json";
+
+/// Write the schema JSON to the local .commonplace.json file
+pub async fn write_schema_file(directory: &Path, schema_json: &str) -> Result<(), std::io::Error> {
+    let schema_path = directory.join(SCHEMA_FILENAME);
+    tokio::fs::write(&schema_path, schema_json).await?;
+    info!("Wrote schema to {}", schema_path.display());
+    Ok(())
+}
 
 /// Recursively collect file paths from an entry, including explicit node_id if present.
 /// Returns Vec<(path, explicit_node_id)> where explicit_node_id is Some if DocEntry has node_id.

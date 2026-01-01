@@ -12,8 +12,9 @@ use commonplace_doc::sync::{
     detect_from_path, directory_watcher_task, encode_node_id, fetch_node_id_from_schema,
     file_watcher_task, fork_node, initial_sync, is_allowed_extension, is_binary_content,
     normalize_path, push_file_content, push_json_content, push_schema_to_server, scan_directory,
-    scan_directory_with_contents, schema_to_json, sse_task, upload_task, DirEvent, FileEvent,
-    FileSyncState, HeadResponse, ReplaceResponse, ScanOptions, SyncState,
+    scan_directory_with_contents, schema_to_json, spawn_file_sync_tasks, sse_task, upload_task,
+    write_schema_file, DirEvent, FileEvent, FileSyncState, HeadResponse, ReplaceResponse,
+    ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -24,7 +25,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -97,9 +97,6 @@ struct Args {
     #[arg(long, conflicts_with = "directory", requires = "exec")]
     sandbox: bool,
 }
-
-/// Filename for the local schema JSON file written during directory sync
-const SCHEMA_FILENAME: &str = ".commonplace.json";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -416,49 +413,6 @@ async fn run_file_mode(
     sse_handle.abort();
 
     info!("Goodbye!");
-    Ok(())
-}
-
-/// Spawn sync tasks (watcher, upload, SSE) for a single file.
-/// Returns the task handles so they can be aborted on file deletion.
-fn spawn_file_sync_tasks(
-    client: Client,
-    server: String,
-    identifier: String,
-    file_path: PathBuf,
-    state: Arc<RwLock<SyncState>>,
-    use_paths: bool,
-) -> Vec<JoinHandle<()>> {
-    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
-
-    vec![
-        // File watcher task
-        tokio::spawn(file_watcher_task(file_path.clone(), file_tx)),
-        // Upload task
-        tokio::spawn(upload_task(
-            client.clone(),
-            server.clone(),
-            identifier.clone(),
-            file_path.clone(),
-            state.clone(),
-            file_rx,
-            use_paths,
-        )),
-        // SSE task
-        tokio::spawn(sse_task(
-            client, server, identifier, file_path, state, use_paths,
-        )),
-    ]
-}
-
-/// Write the schema JSON to the local .commonplace.json file
-async fn write_schema_file(
-    directory: &std::path::Path,
-    schema_json: &str,
-) -> Result<(), std::io::Error> {
-    let schema_path = directory.join(SCHEMA_FILENAME);
-    tokio::fs::write(&schema_path, schema_json).await?;
-    info!("Wrote schema to {}", schema_path.display());
     Ok(())
 }
 

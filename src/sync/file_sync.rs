@@ -5,14 +5,16 @@
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
     build_edit_url, build_replace_url, create_yjs_text_update, detect_from_path, encode_node_id,
-    is_binary_content, push_json_content, refresh_from_head, EditRequest, EditResponse, FileEvent,
-    HeadResponse, ReplaceResponse, SyncState, PENDING_WRITE_TIMEOUT,
+    file_watcher_task, is_binary_content, push_json_content, refresh_from_head, sse_task,
+    EditRequest, EditResponse, FileEvent, HeadResponse, ReplaceResponse, SyncState,
+    PENDING_WRITE_TIMEOUT,
 };
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -477,4 +479,36 @@ pub async fn initial_sync(
     }
 
     Ok(())
+}
+
+/// Spawn sync tasks (watcher, upload, SSE) for a single file.
+/// Returns the task handles so they can be aborted on file deletion.
+pub fn spawn_file_sync_tasks(
+    client: Client,
+    server: String,
+    identifier: String,
+    file_path: PathBuf,
+    state: Arc<RwLock<SyncState>>,
+    use_paths: bool,
+) -> Vec<JoinHandle<()>> {
+    let (file_tx, file_rx) = mpsc::channel::<FileEvent>(100);
+
+    vec![
+        // File watcher task
+        tokio::spawn(file_watcher_task(file_path.clone(), file_tx)),
+        // Upload task
+        tokio::spawn(upload_task(
+            client.clone(),
+            server.clone(),
+            identifier.clone(),
+            file_path.clone(),
+            state.clone(),
+            file_rx,
+            use_paths,
+        )),
+        // SSE task
+        tokio::spawn(sse_task(
+            client, server, identifier, file_path, state, use_paths,
+        )),
+    ]
 }
