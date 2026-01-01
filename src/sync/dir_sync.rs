@@ -453,6 +453,7 @@ pub async fn directory_sse_task(
 /// - Detects if content matches an existing file (for forking)
 /// - Pushes content to server
 /// - Spawns sync tasks for the new file
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_file_created(
     client: &Client,
     server: &str,

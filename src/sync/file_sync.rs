@@ -487,6 +487,7 @@ pub async fn initial_sync(
 /// and pushing/pulling content based on strategy.
 ///
 /// Returns the final identifier used and the content hash.
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_single_file(
     client: &Client,
     server: &str,
