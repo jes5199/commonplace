@@ -4,9 +4,11 @@
 //! with a server document, including schema traversal and UUID mapping.
 
 use crate::fs::{Entry, FsSchema};
+use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
-    build_head_url, detect_from_path, encode_node_id, is_allowed_extension, is_binary_content,
+    build_head_url, detect_from_path, encode_node_id, fork_node, is_allowed_extension,
+    is_binary_content, normalize_path, push_file_content, push_json_content, push_schema_to_server,
     spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
 };
 use futures::StreamExt;
@@ -441,5 +443,298 @@ pub async fn directory_sse_task(
 
         warn!("fs-root SSE connection closed, reconnecting in 5s...");
         sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Handle a file creation event in directory sync mode.
+///
+/// This function handles all the logic for syncing a newly created file:
+/// - Checks ignore patterns and file filters
+/// - Detects if content matches an existing file (for forking)
+/// - Pushes content to server
+/// - Spawns sync tasks for the new file
+pub async fn handle_file_created(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    path: &Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+    use_paths: bool,
+) {
+    debug!("Directory event: file created: {}", path.display());
+
+    // Calculate relative path (normalized to forward slashes for cross-platform consistency)
+    let relative_path = match path.strip_prefix(directory) {
+        Ok(rel) => normalize_path(&rel.to_string_lossy()),
+        Err(_) => return,
+    };
+
+    // Check if file matches ignore patterns
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let should_ignore = options.ignore_patterns.iter().any(|pattern| {
+        if pattern == &file_name {
+            true
+        } else if pattern.contains('*') {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 2 {
+                file_name.starts_with(parts[0]) && file_name.ends_with(parts[1])
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    if should_ignore {
+        debug!(
+            "Ignoring new file (matches ignore pattern): {}",
+            relative_path
+        );
+        return;
+    }
+
+    // Skip hidden files unless configured to include them
+    if !options.include_hidden && file_name.starts_with('.') {
+        debug!("Ignoring hidden file: {}", relative_path);
+        return;
+    }
+
+    // Skip files with disallowed extensions
+    if !is_allowed_extension(path) {
+        debug!("Ignoring file with disallowed extension: {}", relative_path);
+        return;
+    }
+
+    // Check if we already have sync tasks for this file
+    let already_tracked = {
+        let states = file_states.read().await;
+        states.contains_key(&relative_path)
+    };
+
+    if !already_tracked && path.is_file() {
+        // Read file content first (needed for both hash check and push)
+        let raw_content = match tokio::fs::read(path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to read new file {}: {}", path.display(), e);
+                return;
+            }
+        };
+
+        // Compute content hash and check for matching file (fork detection)
+        let content_hash = compute_content_hash(&raw_content);
+        let matching_source = {
+            let states = file_states.read().await;
+            states
+                .iter()
+                .find(|(_, state)| state.content_hash.as_ref() == Some(&content_hash))
+                .map(|(_, state)| state.identifier.clone())
+        };
+
+        // Initial identifier - may be updated after schema push if not using paths
+        let mut identifier = if use_paths {
+            relative_path.clone()
+        } else {
+            format!("{}:{}", fs_root_id, relative_path)
+        };
+        let state = Arc::new(RwLock::new(SyncState::new()));
+
+        // If content matches an existing file, try to fork it
+        let forked_successfully = if let Some(source_id) = matching_source {
+            info!(
+                "New file {} has identical content to {}, forking...",
+                relative_path, source_id
+            );
+
+            // Convert Result to avoid holding Box<dyn Error> across await
+            let fork_result = fork_node(client, server, &source_id, None)
+                .await
+                .map_err(|e| e.to_string());
+
+            match fork_result {
+                Ok(forked_id) => {
+                    info!(
+                        "Forked {} -> {} for new file {}",
+                        source_id, forked_id, relative_path
+                    );
+                    // Update schema to point to forked node
+                    if let Ok(schema) = scan_directory(directory, options) {
+                        if let Ok(json) = schema_to_json(&schema) {
+                            if let Err(e) =
+                                push_schema_to_server(client, server, fs_root_id, &json).await
+                            {
+                                warn!("Failed to push updated schema: {}", e);
+                            }
+                        }
+                    }
+                    // Use the forked ID as the identifier
+                    identifier = forked_id;
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "Fork failed for {}, falling back to new document: {}",
+                        relative_path, e
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        // If fork didn't succeed (no match or fork failed), create document normally
+        if !forked_successfully {
+            // Push updated schema FIRST so server reconciler creates the node
+            if let Ok(schema) = scan_directory(directory, options) {
+                if let Ok(json) = schema_to_json(&schema) {
+                    if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
+                        warn!("Failed to push updated schema: {}", e);
+                    }
+                }
+            }
+
+            // Wait briefly for server to reconcile and create the node
+            sleep(Duration::from_millis(100)).await;
+
+            // When not using paths, fetch the UUID from the updated schema
+            // The reconciler assigns UUIDs to new entries, so we need to look them up
+            if !use_paths {
+                if let Some(uuid) =
+                    fetch_node_id_from_schema(client, server, fs_root_id, &relative_path).await
+                {
+                    info!(
+                        "Resolved UUID for {}: {} -> {}",
+                        relative_path, identifier, uuid
+                    );
+                    identifier = uuid;
+                } else {
+                    warn!(
+                        "Could not resolve UUID for {}, using derived ID: {}",
+                        relative_path, identifier
+                    );
+                }
+            }
+
+            // Now push initial content (handle binary files)
+            let content_info = detect_from_path(path);
+            let is_binary = content_info.is_binary || is_binary_content(&raw_content);
+
+            let content = if is_binary {
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                STANDARD.encode(&raw_content)
+            } else {
+                String::from_utf8_lossy(&raw_content).to_string()
+            };
+
+            if let Err(e) = if !is_binary && content_info.mime_type == "application/json" {
+                push_json_content(client, server, &identifier, &content, &state, use_paths).await
+            } else {
+                push_file_content(client, server, &identifier, &content, &state, use_paths).await
+            } {
+                warn!("Failed to push new file content: {}", e);
+            }
+        }
+
+        // Spawn sync tasks for the new file
+        let task_handles = spawn_file_sync_tasks(
+            client.clone(),
+            server.to_string(),
+            identifier.clone(),
+            path.to_path_buf(),
+            state.clone(),
+            use_paths,
+        );
+
+        // Add to file_states with task handles
+        {
+            let mut states = file_states.write().await;
+            states.insert(
+                relative_path.clone(),
+                FileSyncState {
+                    relative_path: relative_path.clone(),
+                    identifier,
+                    state,
+                    task_handles,
+                    use_paths,
+                    content_hash: Some(content_hash),
+                },
+            );
+        }
+
+        info!("Started sync for new local file: {}", relative_path);
+    }
+}
+
+/// Handle a file modification event in directory sync mode.
+///
+/// Modified files are handled by per-file watchers, so this just updates
+/// the schema in case metadata changed.
+pub async fn handle_file_modified(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    path: &Path,
+    options: &ScanOptions,
+) {
+    debug!("Directory event: file modified: {}", path.display());
+    // Modified files are handled by per-file watchers
+    // Just update schema in case metadata changed
+    if let Ok(schema) = scan_directory(directory, options) {
+        if let Ok(json) = schema_to_json(&schema) {
+            if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
+                warn!("Failed to push updated schema: {}", e);
+            }
+        }
+    }
+}
+
+/// Handle a file deletion event in directory sync mode.
+///
+/// Stops sync tasks for the deleted file and updates the schema.
+pub async fn handle_file_deleted(
+    client: &Client,
+    server: &str,
+    fs_root_id: &str,
+    directory: &Path,
+    path: &Path,
+    options: &ScanOptions,
+    file_states: &Arc<RwLock<HashMap<String, FileSyncState>>>,
+) {
+    debug!("Directory event: file deleted: {}", path.display());
+
+    // Calculate relative path (normalized to forward slashes for cross-platform consistency)
+    let relative_path = match path.strip_prefix(directory) {
+        Ok(rel) => normalize_path(&rel.to_string_lossy()),
+        Err(_) => {
+            warn!("Could not strip prefix from deleted path");
+            return;
+        }
+    };
+
+    // Stop sync tasks for this file and remove from file_states
+    {
+        let mut states = file_states.write().await;
+        if let Some(file_state) = states.remove(&relative_path) {
+            info!("Stopping sync tasks for deleted file: {}", relative_path);
+            for handle in file_state.task_handles {
+                handle.abort();
+            }
+        }
+    }
+
+    // Rescan and push updated schema
+    if let Ok(schema) = scan_directory(directory, options) {
+        if let Ok(json) = schema_to_json(&schema) {
+            if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
+                warn!("Failed to push updated schema: {}", e);
+            }
+        }
     }
 }
