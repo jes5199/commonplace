@@ -27,7 +27,8 @@ pub use file_sync::{
 };
 
 pub use content_type::{
-    detect_from_path, is_allowed_extension, is_binary_content, ContentTypeInfo,
+    detect_from_path, is_allowed_extension, is_binary_content, looks_like_base64_binary,
+    ContentTypeInfo,
 };
 pub use directory::{
     scan_directory, scan_directory_with_contents, schema_to_json, ScanError, ScanOptions,

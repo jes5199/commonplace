@@ -8,8 +8,9 @@ use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
 use crate::sync::state_file::compute_content_hash;
 use crate::sync::{
     build_head_url, detect_from_path, encode_node_id, fork_node, is_allowed_extension,
-    is_binary_content, normalize_path, push_file_content, push_json_content, push_schema_to_server,
-    spawn_file_sync_tasks, FileSyncState, HeadResponse, SyncState,
+    is_binary_content, looks_like_base64_binary, normalize_path, push_file_content,
+    push_json_content, push_schema_to_server, spawn_file_sync_tasks, FileSyncState, HeadResponse,
+    SyncState,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -571,19 +572,22 @@ pub async fn handle_schema_change(
                                     file_head.content.as_bytes().to_vec()
                                 }
                             }
-                        } else {
-                            // Extension says text, but try decoding as base64 in case
-                            // this was a binary file detected by content sniffing
+                        } else if looks_like_base64_binary(&file_head.content) {
+                            // Extension says text, but content looks like base64 binary
+                            // This handles files that were detected as binary on upload
                             match STANDARD.decode(&file_head.content) {
                                 Ok(decoded) if is_binary_content(&decoded) => {
                                     // Successfully decoded and content is binary
                                     decoded
                                 }
                                 _ => {
-                                    // Not base64 or not binary - write as text
+                                    // Decode failed or not binary - write as text
                                     file_head.content.as_bytes().to_vec()
                                 }
                             }
+                        } else {
+                            // Extension says text, content doesn't look like base64 binary
+                            file_head.content.as_bytes().to_vec()
                         };
                         tokio::fs::write(&file_path, &bytes_written).await?;
 
