@@ -1033,8 +1033,11 @@ pub fn find_owning_document(
     let mut path_start_index = 0;
 
     // For each directory component (not the last one, which is the file)
-    for i in 0..components.len().saturating_sub(1) {
-        let component = components[i];
+    for (i, component) in components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .enumerate()
+    {
         info!(
             "find_owning_document: checking component '{}' at index {}",
             component, i
@@ -1044,27 +1047,25 @@ pub fn find_owning_document(
         let schema_path = current_dir.join(SCHEMA_FILENAME);
         if let Ok(content) = std::fs::read_to_string(&schema_path) {
             if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
-                if let Some(ref root) = schema.root {
-                    if let Entry::Dir(dir_entry) = root {
-                        if let Some(ref entries) = dir_entry.entries {
-                            info!("find_owning_document: schema has {} entries", entries.len());
-                            if let Some(entry) = entries.get(component) {
-                                info!("find_owning_document: found entry for '{}'", component);
-                                if let Entry::Dir(subdir) = entry {
+                if let Some(Entry::Dir(dir_entry)) = schema.root.as_ref() {
+                    if let Some(ref entries) = dir_entry.entries {
+                        info!("find_owning_document: schema has {} entries", entries.len());
+                        if let Some(entry) = entries.get(*component) {
+                            info!("find_owning_document: found entry for '{}'", component);
+                            if let Entry::Dir(subdir) = entry {
+                                info!(
+                                    "find_owning_document: entry is dir, node_id={:?}",
+                                    subdir.node_id
+                                );
+                                if let Some(ref node_id) = subdir.node_id {
+                                    // This is a node-backed directory!
+                                    // The remaining path belongs to this document
                                     info!(
-                                        "find_owning_document: entry is dir, node_id={:?}",
-                                        subdir.node_id
+                                        "find_owning_document: FOUND node-backed dir '{}' with id {}",
+                                        component, node_id
                                     );
-                                    if let Some(ref node_id) = subdir.node_id {
-                                        // This is a node-backed directory!
-                                        // The remaining path belongs to this document
-                                        info!(
-                                            "find_owning_document: FOUND node-backed dir '{}' with id {}",
-                                            component, node_id
-                                        );
-                                        current_document_id = node_id.clone();
-                                        path_start_index = i + 1;
-                                    }
+                                    current_document_id = node_id.clone();
+                                    path_start_index = i + 1;
                                 }
                             }
                         }

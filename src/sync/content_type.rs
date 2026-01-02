@@ -223,7 +223,7 @@ pub fn looks_like_base64_binary(content: &str) -> bool {
     }
 
     // Length must be multiple of 4 for valid base64
-    content.len() % 4 == 0
+    content.len().is_multiple_of(4)
 }
 
 /// Check if file content appears to be binary by sampling first bytes.
