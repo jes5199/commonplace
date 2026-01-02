@@ -788,6 +788,125 @@ async fn handle_schema_change_with_dedup(
     Ok(true)
 }
 
+/// Result of finding which document owns a given file path.
+///
+/// When files are in node-backed subdirectories, they belong to that subdirectory's
+/// document rather than the root fs-root document.
+pub struct OwningDocument {
+    /// The document ID that owns this file (fs_root_id or a subdirectory's node_id)
+    pub document_id: String,
+    /// The path relative to the owning document's root
+    pub relative_path: String,
+    /// The directory on disk that corresponds to the owning document
+    pub directory: PathBuf,
+}
+
+/// Find which document owns a file path, accounting for node-backed subdirectories.
+///
+/// When a file is in a node-backed subdirectory, the file belongs to that subdirectory's
+/// document (identified by node_id) rather than the root fs-root document.
+///
+/// For example, if workspace/text-to-telegram is a node-backed directory:
+/// - File: workspace/text-to-telegram/test.txt
+/// - Returns: OwningDocument { document_id: "subdir-node-id", relative_path: "test.txt" }
+///
+/// If the file is not in a node-backed subdirectory:
+/// - File: workspace/content.txt
+/// - Returns: OwningDocument { document_id: fs_root_id, relative_path: "content.txt" }
+pub fn find_owning_document(
+    root_directory: &Path,
+    fs_root_id: &str,
+    relative_path: &str,
+) -> OwningDocument {
+    // Split path into components
+    let components: Vec<&str> = relative_path.split('/').collect();
+    info!(
+        "find_owning_document: path={}, components={:?}",
+        relative_path, components
+    );
+
+    // Walk from root checking each directory for node-backed status
+    let mut current_dir = root_directory.to_path_buf();
+    let mut current_document_id = fs_root_id.to_string();
+    let mut path_start_index = 0;
+
+    // For each directory component (not the last one, which is the file)
+    for i in 0..components.len().saturating_sub(1) {
+        let component = components[i];
+        info!(
+            "find_owning_document: checking component '{}' at index {}",
+            component, i
+        );
+
+        // Check if parent has a .commonplace.json with this component as a node-backed entry
+        let schema_path = current_dir.join(SCHEMA_FILENAME);
+        if let Ok(content) = std::fs::read_to_string(&schema_path) {
+            if let Ok(schema) = serde_json::from_str::<FsSchema>(&content) {
+                if let Some(ref root) = schema.root {
+                    if let Entry::Dir(dir_entry) = root {
+                        if let Some(ref entries) = dir_entry.entries {
+                            info!("find_owning_document: schema has {} entries", entries.len());
+                            if let Some(entry) = entries.get(component) {
+                                info!("find_owning_document: found entry for '{}'", component);
+                                if let Entry::Dir(subdir) = entry {
+                                    info!(
+                                        "find_owning_document: entry is dir, node_id={:?}",
+                                        subdir.node_id
+                                    );
+                                    if let Some(ref node_id) = subdir.node_id {
+                                        // This is a node-backed directory!
+                                        // The remaining path belongs to this document
+                                        info!(
+                                            "find_owning_document: FOUND node-backed dir '{}' with id {}",
+                                            component, node_id
+                                        );
+                                        current_document_id = node_id.clone();
+                                        path_start_index = i + 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                info!(
+                    "find_owning_document: failed to parse schema from {:?}",
+                    schema_path
+                );
+            }
+        } else {
+            info!("find_owning_document: no schema at {:?}", schema_path);
+        }
+
+        // Move into this directory for next iteration
+        current_dir = current_dir.join(component);
+    }
+
+    // Build the relative path within the owning document
+    let remaining_path = if path_start_index < components.len() {
+        components[path_start_index..].join("/")
+    } else {
+        String::new()
+    };
+
+    // Compute the directory for the owning document
+    let owning_directory = if path_start_index == 0 {
+        root_directory.to_path_buf()
+    } else {
+        let mut dir = root_directory.to_path_buf();
+        for component in &components[0..path_start_index] {
+            dir = dir.join(component);
+        }
+        dir
+    };
+
+    OwningDocument {
+        document_id: current_document_id,
+        relative_path: remaining_path,
+        directory: owning_directory,
+    }
+}
+
 /// Handle a file creation event in directory sync mode.
 ///
 /// This function handles all the logic for syncing a newly created file:
@@ -813,6 +932,13 @@ pub async fn handle_file_created(
         Ok(rel) => normalize_path(&rel.to_string_lossy()),
         Err(_) => return,
     };
+
+    // Find which document owns this file path (may be a node-backed subdirectory)
+    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+    debug!(
+        "File {} owned by document {} (relative: {})",
+        relative_path, owning_doc.document_id, owning_doc.relative_path
+    );
 
     // Check if file matches ignore patterns
     let file_name = path
@@ -880,10 +1006,11 @@ pub async fn handle_file_created(
         };
 
         // Initial identifier - may be updated after schema push if not using paths
+        // Use the owning document's relative path, not the full relative path
         let mut identifier = if use_paths {
-            relative_path.clone()
+            owning_doc.relative_path.clone()
         } else {
-            format!("{}:{}", fs_root_id, relative_path)
+            format!("{}:{}", owning_doc.document_id, owning_doc.relative_path)
         };
         let state = Arc::new(RwLock::new(SyncState::new()));
 
@@ -906,10 +1033,16 @@ pub async fn handle_file_created(
                         source_id, forked_id, relative_path
                     );
                     // Update schema to point to forked node
-                    if let Ok(schema) = scan_directory(directory, options) {
+                    // Use the owning document's directory and ID
+                    if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
                         if let Ok(json) = schema_to_json(&schema) {
-                            if let Err(e) =
-                                push_schema_to_server(client, server, fs_root_id, &json).await
+                            if let Err(e) = push_schema_to_server(
+                                client,
+                                server,
+                                &owning_doc.document_id,
+                                &json,
+                            )
+                            .await
                             {
                                 warn!("Failed to push updated schema: {}", e);
                             }
@@ -934,9 +1067,12 @@ pub async fn handle_file_created(
         // If fork didn't succeed (no match or fork failed), create document normally
         if !forked_successfully {
             // Push updated schema FIRST so server reconciler creates the node
-            if let Ok(schema) = scan_directory(directory, options) {
+            // Use the owning document's directory and ID
+            if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
                 if let Ok(json) = schema_to_json(&schema) {
-                    if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
+                    if let Err(e) =
+                        push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+                    {
                         warn!("Failed to push updated schema: {}", e);
                     }
                 }
@@ -947,19 +1083,25 @@ pub async fn handle_file_created(
 
             // When not using paths, fetch the UUID from the updated schema
             // The reconciler assigns UUIDs to new entries, so we need to look them up
+            // Use the owning document's relative path
             if !use_paths {
-                if let Some(uuid) =
-                    fetch_node_id_from_schema(client, server, fs_root_id, &relative_path).await
+                if let Some(uuid) = fetch_node_id_from_schema(
+                    client,
+                    server,
+                    &owning_doc.document_id,
+                    &owning_doc.relative_path,
+                )
+                .await
                 {
                     info!(
                         "Resolved UUID for {}: {} -> {}",
-                        relative_path, identifier, uuid
+                        owning_doc.relative_path, identifier, uuid
                     );
                     identifier = uuid;
                 } else {
                     warn!(
                         "Could not resolve UUID for {}, using derived ID: {}",
-                        relative_path, identifier
+                        owning_doc.relative_path, identifier
                     );
                 }
             }
@@ -1027,11 +1169,24 @@ pub async fn handle_file_modified(
     options: &ScanOptions,
 ) {
     debug!("Directory event: file modified: {}", path.display());
+
+    // Calculate relative path
+    let relative_path = match path.strip_prefix(directory) {
+        Ok(rel) => normalize_path(&rel.to_string_lossy()),
+        Err(_) => return,
+    };
+
+    // Find which document owns this file path
+    let owning_doc = find_owning_document(directory, fs_root_id, &relative_path);
+
     // Modified files are handled by per-file watchers
     // Just update schema in case metadata changed
-    if let Ok(schema) = scan_directory(directory, options) {
+    // Use the owning document's directory and ID
+    if let Ok(schema) = scan_directory(&owning_doc.directory, options) {
         if let Ok(json) = schema_to_json(&schema) {
-            if let Err(e) = push_schema_to_server(client, server, fs_root_id, &json).await {
+            if let Err(e) =
+                push_schema_to_server(client, server, &owning_doc.document_id, &json).await
+            {
                 warn!("Failed to push updated schema: {}", e);
             }
         }
