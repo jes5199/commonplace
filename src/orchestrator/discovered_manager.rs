@@ -1017,13 +1017,16 @@ impl DiscoveredProcessManager {
                         if let Some(pid) = child.id() {
                             // Kill the entire process group (negative pid)
                             // This ensures all descendants are terminated
+                            tracing::debug!("[discovery] Sending SIGTERM to process group {}", pid);
                             unsafe {
                                 libc::killpg(pid as i32, libc::SIGTERM);
                             }
                         }
                     }
 
-                    let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    // Give processes 10 seconds to shutdown gracefully
+                    // This allows sync to properly terminate its exec child
+                    let timeout = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
 
                     match timeout {
                         Ok(Ok(_)) => {
@@ -1031,12 +1034,16 @@ impl DiscoveredProcessManager {
                         }
                         _ => {
                             tracing::warn!(
-                                "[discovery] '{}' didn't stop gracefully, force killing process group",
+                                "[discovery] '{}' didn't stop gracefully after 10s, force killing process group",
                                 name
                             );
                             // Force kill the entire process group
                             #[cfg(unix)]
                             if let Some(pid) = child.id() {
+                                tracing::debug!(
+                                    "[discovery] Sending SIGKILL to process group {}",
+                                    pid
+                                );
                                 unsafe {
                                     libc::killpg(pid as i32, libc::SIGKILL);
                                 }
