@@ -114,6 +114,28 @@ Default content by type:
 
 **Before committing:** Always run `cargo clippy` and `cargo test`. A pre-commit hook runs clippy automatically.
 
+## File Linking in Workspaces
+
+**IMPORTANT**: Never use filesystem symlinks to share content between sandbox directories. Use `commonplace-link` instead.
+
+### Why commonplace-link instead of symlinks?
+
+- Symlinks break sandbox isolation (processes can escape their directory)
+- Symlinks don't sync correctly through commonplace
+- commonplace-link assigns the same UUID to multiple files, enabling CRDT-based sync
+
+### Usage
+
+```bash
+# Link two files (they will share the same content via commonplace sync)
+commonplace-link text-to-telegram/content.txt bartleby/prompts.txt
+
+# Both files now have the same UUID in their .commonplace.json
+# Changes to either file propagate to the other through sync
+```
+
+See `docs/SANDBOX_LINKING.md` for detailed architecture.
+
 ## Git Configuration
 
 - Main branch: `main`
