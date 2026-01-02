@@ -190,10 +190,12 @@ For example: `bd create --help` shows `--parent`, `--deps`, `--assignee`, etc.
 - ✅ Check bd ready before asking "what should I work on?"
 - ✅ Store AI planning docs in `history/` directory
 - ✅ Run `bd <cmd> --help` to discover available flags
+- ✅ Use `commonplace-link` to share files between sandboxes
 - ❌ Do NOT create markdown TODO lists
 - ❌ Do NOT use external issue trackers
 - ❌ Do NOT duplicate tracking systems
 - ❌ Do NOT clutter repo root with planning documents
+- ❌ Do NOT use filesystem symlinks for file sharing (breaks sync)
 
 For more details, see README.md and QUICKSTART.md.
 
