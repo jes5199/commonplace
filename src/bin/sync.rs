@@ -306,18 +306,29 @@ async fn main() -> ExitCode {
     // Route to appropriate mode
     let result = if args.sandbox {
         // Sandbox mode: create temp directory, sync there, run command, clean up
+        // Clean up stale sandbox directories from previous runs (killed by SIGKILL)
+        cleanup_stale_sandboxes();
+
+        // Create sandbox with our prefix for easy identification during cleanup
         let sandbox_dir =
             std::env::temp_dir().join(format!("commonplace-sandbox-{}", uuid::Uuid::new_v4()));
-        info!("Creating sandbox directory: {}", sandbox_dir.display());
 
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir) {
             error!("Failed to create sandbox directory: {}", e);
             return ExitCode::from(1);
         }
+        info!("Creating sandbox directory: {}", sandbox_dir.display());
 
-        // Always ignore the schema file (.commonplace.json) when scanning
+        // Write PID file to mark this sandbox as active
+        let pid_file = sandbox_dir.join(".pid");
+        if let Err(e) = std::fs::write(&pid_file, std::process::id().to_string()) {
+            warn!("Failed to write PID file: {}", e);
+        }
+
+        // Always ignore the schema file and PID file when scanning
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
+        ignore_patterns.push(".pid".to_string());
 
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
@@ -1122,4 +1133,95 @@ async fn run_exec_mode(
 
     info!("Goodbye!");
     Ok(exit_code)
+}
+
+/// Clean up stale sandbox directories from previous runs.
+/// This handles directories left behind when a process was killed with SIGKILL
+/// (which doesn't allow cleanup code to run).
+fn cleanup_stale_sandboxes() {
+    let temp_dir = std::env::temp_dir();
+
+    // Look for directories matching our sandbox pattern
+    let entries = match std::fs::read_dir(&temp_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(
+                "Failed to read temp directory for stale sandbox cleanup: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let mut cleaned = 0;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        // Only process directories with our prefix
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !name.starts_with("commonplace-sandbox-") {
+            continue;
+        }
+
+        // Check if this sandbox is still active by reading its PID file
+        // Only clean up if we can confirm the owning process is dead
+        let pid_file = path.join(".pid");
+        let can_cleanup = if pid_file.exists() {
+            // PID file exists - check if process is still running
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid_str) => match pid_str.trim().parse::<u32>() {
+                    Ok(pid) => !is_process_running(pid), // Clean up only if process is dead
+                    Err(_) => false,                     // Invalid PID, don't clean up to be safe
+                },
+                Err(_) => false, // Can't read PID file, don't clean up to be safe
+            }
+        } else {
+            // No PID file - this could be a legacy sandbox or one where PID write failed
+            // Be conservative: don't delete directories without PID files
+            // They'll be cleaned up manually or when someone adds a PID file
+            false
+        };
+
+        if !can_cleanup {
+            continue;
+        }
+
+        // PID file exists and process is confirmed dead - safe to clean up
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                info!("Cleaned up stale sandbox: {}", path.display());
+                cleaned += 1;
+            }
+            Err(e) => {
+                // Directory might be in use by another process, that's fine
+                debug!("Could not remove stale sandbox {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    if cleaned > 0 {
+        info!("Cleaned up {} stale sandbox directories", cleaned);
+    }
+}
+
+/// Check if a process with the given PID is still running.
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    // On Unix, sending signal 0 checks if process exists without actually sending a signal
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_process_running(_pid: u32) -> bool {
+    // On non-Unix platforms, assume process might be running to be safe
+    true
 }
