@@ -932,9 +932,36 @@ pub async fn handle_file_created(
     debug!("Directory event: file created: {}", path.display());
 
     // Calculate relative path (normalized to forward slashes for cross-platform consistency)
-    let relative_path = match path.strip_prefix(directory) {
+    // First canonicalize both paths to handle absolute vs relative path mismatches
+    let canonical_dir = match directory.canonicalize() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                "Failed to canonicalize directory {}: {}",
+                directory.display(),
+                e
+            );
+            return;
+        }
+    };
+    let canonical_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Failed to canonicalize path {}: {}", path.display(), e);
+            return;
+        }
+    };
+    let relative_path = match canonical_path.strip_prefix(&canonical_dir) {
         Ok(rel) => normalize_path(&rel.to_string_lossy()),
-        Err(_) => return,
+        Err(e) => {
+            warn!(
+                "Failed to strip prefix {} from {}: {}",
+                canonical_dir.display(),
+                canonical_path.display(),
+                e
+            );
+            return;
+        }
     };
 
     // Find which document owns this file path (may be a node-backed subdirectory)
@@ -1174,8 +1201,16 @@ pub async fn handle_file_modified(
 ) {
     debug!("Directory event: file modified: {}", path.display());
 
-    // Calculate relative path
-    let relative_path = match path.strip_prefix(directory) {
+    // Calculate relative path - canonicalize both paths first
+    let canonical_dir = match directory.canonicalize() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let canonical_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let relative_path = match canonical_path.strip_prefix(&canonical_dir) {
         Ok(rel) => normalize_path(&rel.to_string_lossy()),
         Err(_) => return,
     };
@@ -1361,11 +1396,28 @@ pub async fn handle_file_deleted(
 ) {
     debug!("Directory event: file deleted: {}", path.display());
 
-    // Calculate relative path (normalized to forward slashes for cross-platform consistency)
-    let relative_path = match path.strip_prefix(directory) {
+    // Calculate relative path - canonicalize the directory, but the file may not exist
+    // For deleted files, we need to strip the canonical dir prefix from the absolute path
+    let canonical_dir = match directory.canonicalize() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    // Try to make path absolute if it isn't already
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let relative_path = match absolute_path.strip_prefix(&canonical_dir) {
         Ok(rel) => normalize_path(&rel.to_string_lossy()),
         Err(_) => {
-            warn!("Could not strip prefix from deleted path");
+            warn!(
+                "Could not strip prefix {} from {}",
+                canonical_dir.display(),
+                absolute_path.display()
+            );
             return;
         }
     };
