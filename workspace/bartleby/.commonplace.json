@@ -1,0 +1,30 @@
+{
+    "version": 1,
+    "root": {
+        "type": "dir",
+        "entries": {
+            "system_prompt.txt": {
+                "type": "doc",
+                "node_id": "9b4d7f6c-b227-4059-b195-d390a74f2514",
+                "content_type": "text/plain"
+            },
+            "output.txt": {
+                "type": "doc",
+                "node_id": "12504d60-2b58-43c8-b461-a42215a3954d",
+                "content_type": "text/plain"
+            },
+            "prompts.txt": {
+                "type": "doc",
+                "node_id": "702bacdf-3577-4e0f-9550-d2589d3333fa",
+                "content_type": "text/plain"
+            },
+            "processes.json": {
+                "type": "doc",
+                "node_id": "b8e2f3a1-4567-4890-abcd-ef1234567890",
+                "content_type": "application/json"
+            }
+        },
+        "node_id": null,
+        "content_type": null
+    }
+}

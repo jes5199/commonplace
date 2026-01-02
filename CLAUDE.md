@@ -101,16 +101,51 @@ Default content by type:
 - XML: `<?xml version="1.0" encoding="UTF-8"?><root/>`
 - Text: empty string
 
+## Running the System
+
+The **orchestrator** is the main entry point for running the full commonplace system. It manages all processes including the server, sync client, and application processes like bartleby.
+
+### Quick Start
+
+```bash
+# Build and run everything
+cargo build --release
+cargo run --release --bin commonplace-orchestrator
+```
+
+The orchestrator reads `commonplace.json` which defines:
+- **server**: The document server (commonplace-server)
+- **sync**: File sync client (commonplace-sync)
+- **Application processes**: bartleby, text-to-telegram, etc.
+
+### Configuration
+
+Edit `commonplace.json` to configure:
+- `mqtt_broker`: MQTT broker for process communication
+- `processes`: Map of process definitions with commands, args, cwd, restart policies, and dependencies
+
+### Running Individual Components
+
+For development/testing, you can run components separately:
+
+```bash
+# Server only
+cargo run --bin commonplace-server -- --database ./data.redb --fs-root workspace
+
+# Sync only (requires server running)
+cargo run --bin commonplace-sync -- --server http://localhost:3000 --node workspace --directory ./workspace
+```
+
 ## Development Commands
 
 - `cargo build` - Build all binaries
-- `cargo run --bin commonplace-server` - Run the HTTP server
-- `cargo run --bin commonplace-sync` - Run the file sync client
+- `cargo run --bin commonplace-orchestrator` - Run the full system via orchestrator
+- `cargo run --bin commonplace-server` - Run the HTTP server only
+- `cargo run --bin commonplace-sync` - Run the file sync client only
 - `cargo test` - Run tests
 - `cargo clippy` - Run linter (required before commit)
 - `cargo fmt` - Format code
 - `RUST_LOG=debug cargo run --bin commonplace-server` - Run with debug logging
-- `cargo run --bin commonplace-server -- --database ./data.redb` - Run with persistence
 
 **Before committing:** Always run `cargo clippy` and `cargo test`. A pre-commit hook runs clippy automatically.
 
