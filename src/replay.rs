@@ -8,6 +8,7 @@ use crate::commit::Commit;
 use crate::document::ContentType;
 use crate::store::{CommitStore, StoreError};
 use std::collections::HashSet;
+use tracing::debug;
 use yrs::types::ToJson;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, ReadTxn, Transact, Value};
@@ -118,9 +119,20 @@ impl<'a> CommitReplayer<'a> {
             }
         }
 
-        for (_, commit) in commits {
+        debug!(
+            "Replaying {} commits to target {}",
+            commits.len(),
+            target_cid
+        );
+
+        for (cid, commit) in &commits {
             // Skip empty updates (e.g., merge commits)
             if commit.update.is_empty() {
+                debug!(
+                    "  {} (ts={}): EMPTY update (merge commit)",
+                    &cid[..8],
+                    commit.timestamp
+                );
                 continue;
             }
 
@@ -128,8 +140,20 @@ impl<'a> CommitReplayer<'a> {
                 .map_err(|e| ReplayError::InvalidUpdate(e.to_string()))?;
 
             if update_bytes.is_empty() {
+                debug!(
+                    "  {} (ts={}): empty after decode",
+                    &cid[..8],
+                    commit.timestamp
+                );
                 continue;
             }
+
+            debug!(
+                "  {} (ts={}): applying {} bytes",
+                &cid[..8],
+                commit.timestamp,
+                update_bytes.len()
+            );
 
             let update = yrs::Update::decode_v1(&update_bytes)
                 .map_err(|e| ReplayError::InvalidUpdate(e.to_string()))?;
@@ -249,6 +273,23 @@ impl<'a> CommitReplayer<'a> {
 
         // Sort by timestamp (oldest first) for proper replay order
         result.sort_by_key(|(_, c)| c.timestamp);
+
+        debug!(
+            "collect_commits_to_target({}) found {} commits",
+            &target_cid[..8],
+            result.len()
+        );
+        for (i, (cid, commit)) in result.iter().enumerate() {
+            debug!(
+                "  [{}] {} ts={} parents={:?} update_len={}",
+                i,
+                &cid[..8],
+                commit.timestamp,
+                commit.parents.iter().map(|p| &p[..8]).collect::<Vec<_>>(),
+                commit.update.len()
+            );
+        }
+
         Ok(result)
     }
 
