@@ -116,8 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Apply opt-out flags
+    let graph = args.graph && !args.no_graph && !args.oneline;
+    let decorate = (args.decorate || graph) && !args.no_decorate;
+
     // Fetch diffs (default on, unless --no-patch or --oneline/--graph)
-    let show_patch = !args.no_patch && !args.oneline && !args.graph;
+    let show_patch = !args.no_patch && !args.oneline && !graph;
     let diffs: Option<Vec<Option<String>>> = if show_patch {
         Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
     } else {
@@ -132,6 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &changes.changes,
         &stats_map,
         &diffs,
+        graph,
+        decorate,
     )?;
 
     // Use pager if interactive terminal and not disabled
@@ -151,6 +157,8 @@ fn build_output(
     changes: &[CommitChange],
     stats_map: &Option<Vec<Option<ChangeStats>>>,
     diffs: &Option<Vec<Option<String>>>,
+    graph: bool,
+    decorate: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut out = String::new();
 
@@ -177,7 +185,7 @@ fn build_output(
         for (i, change) in changes.iter().enumerate() {
             let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
             let date = format_timestamp_short(change.timestamp);
-            let decoration = if args.decorate && i == 0 {
+            let decoration = if decorate && i == 0 {
                 " \x1b[36m(HEAD)\x1b[0m"
             } else {
                 ""
@@ -199,12 +207,8 @@ fn build_output(
                 cid_short, decoration, date
             ));
         }
-    } else if args.graph {
-        out.push_str(&build_graph_view(
-            changes,
-            stats_map.as_ref(),
-            args.decorate,
-        ));
+    } else if graph {
+        out.push_str(&build_graph_view(changes, stats_map.as_ref(), decorate));
     } else {
         // Full output (like git log)
         out.push_str(&format!("File: {}\n", rel_path));
@@ -212,7 +216,7 @@ fn build_output(
         out.push('\n');
 
         for (i, change) in changes.iter().enumerate() {
-            let decoration = if args.decorate && i == 0 {
+            let decoration = if decorate && i == 0 {
                 " \x1b[36m(HEAD)\x1b[0m"
             } else {
                 ""

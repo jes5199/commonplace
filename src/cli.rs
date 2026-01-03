@@ -206,13 +206,21 @@ pub struct LogArgs {
     #[clap(long)]
     pub oneline: bool,
 
-    /// Show ASCII graph of commit ancestry (for branching history)
-    #[clap(long)]
+    /// Show ASCII graph of commit ancestry (default: on)
+    #[clap(long, default_value = "true", action = clap::ArgAction::SetTrue)]
     pub graph: bool,
 
-    /// Show ref-like decorations (HEAD marker) next to commits
+    /// Disable graph output
     #[clap(long)]
+    pub no_graph: bool,
+
+    /// Show ref-like decorations (HEAD marker) (default: on)
+    #[clap(long, default_value = "true", action = clap::ArgAction::SetTrue)]
     pub decorate: bool,
+
+    /// Disable decorations
+    #[clap(long)]
+    pub no_decorate: bool,
 
     /// Show change statistics (lines added/removed)
     #[clap(long)]
