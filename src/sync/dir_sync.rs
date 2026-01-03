@@ -5,7 +5,9 @@
 
 use crate::fs::{Entry, FsSchema};
 use crate::sync::directory::{scan_directory, schema_to_json, ScanOptions};
-use crate::sync::state_file::compute_content_hash;
+use crate::sync::state_file::{
+    compute_content_hash, load_synced_directories, mark_directory_synced, unmark_directory_synced,
+};
 use crate::sync::{
     build_head_url, detect_from_path, encode_node_id, fork_node, is_allowed_extension,
     is_binary_content, looks_like_base64_binary, normalize_path, push_file_content,
@@ -95,12 +97,12 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
 
         // If this directory isn't in the schema, mark it for removal
         if !schema_dirs.contains(&name) {
-            dirs_to_remove.push(path);
+            dirs_to_remove.push((path, name));
         }
     }
 
-    // Remove orphaned directories
-    for dir_path in dirs_to_remove {
+    // Remove orphaned directories and unmark them from sync state
+    for (dir_path, name) in dirs_to_remove {
         info!(
             "Removing orphaned directory (not in schema): {}",
             dir_path.display()
@@ -108,7 +110,44 @@ async fn cleanup_orphaned_directories(directory: &Path, schema: &FsSchema) {
         if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
             warn!("Failed to remove directory {}: {}", dir_path.display(), e);
         }
+        // Unmark this directory from synced state
+        if let Err(e) = unmark_directory_synced(directory, &name).await {
+            debug!("Failed to unmark directory synced: {}", e);
+        }
     }
+}
+
+/// Detect directories that were synced but are now deleted locally.
+///
+/// This returns directories that:
+/// 1. Exist in the schema
+/// 2. Don't exist on disk
+/// 3. Were previously synced (tracked in state file)
+///
+/// These directories should be removed from the schema because the user
+/// intentionally deleted them locally.
+pub async fn find_locally_deleted_directories(directory: &Path, schema: &FsSchema) -> Vec<String> {
+    let schema_dirs = collect_schema_directories(schema);
+    let synced_dirs = load_synced_directories(directory).await;
+
+    let mut deleted = Vec::new();
+
+    for dir_name in &schema_dirs {
+        let dir_path = directory.join(dir_name);
+        // Directory in schema but not on disk
+        if !dir_path.exists() {
+            // Check if it was previously synced
+            if synced_dirs.contains(dir_name) {
+                info!(
+                    "Directory '{}' was synced but deleted locally - will remove from schema",
+                    dir_name
+                );
+                deleted.push(dir_name.clone());
+            }
+        }
+    }
+
+    deleted
 }
 
 /// Collect all directory names from the schema's root entries.
@@ -691,8 +730,26 @@ pub async fn handle_schema_change(
         states.keys().cloned().collect()
     };
 
+    // Find directories that were synced but are now deleted locally
+    // These should not be recreated (user intentionally deleted them)
+    let locally_deleted_dirs = find_locally_deleted_directories(directory, &schema).await;
+
     for (path, explicit_node_id) in &schema_paths {
         if !known_paths.contains(path) {
+            // Check if the file's parent directory was deleted locally
+            // If so, skip creating this file (it will be removed from schema)
+            let path_parts: Vec<&str> = path.split('/').collect();
+            if path_parts.len() > 1 {
+                let parent_dir = path_parts[0];
+                if locally_deleted_dirs.contains(&parent_dir.to_string()) {
+                    debug!(
+                        "Skipping file {} - parent directory '{}' was deleted locally",
+                        path, parent_dir
+                    );
+                    continue;
+                }
+            }
+
             // New file from server - create local file and fetch content
             let file_path = directory.join(path);
 
@@ -718,10 +775,25 @@ pub async fn handle_schema_change(
                 file_path.display()
             );
 
-            // Create parent directories if needed
+            // Create parent directories if needed and track them
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
                     tokio::fs::create_dir_all(parent).await?;
+                    // Track the directories we created
+                    let mut current = parent;
+                    while let Ok(rel) = current.strip_prefix(directory) {
+                        let rel_str = rel.to_string_lossy().to_string();
+                        if !rel_str.is_empty() {
+                            if let Err(e) = mark_directory_synced(directory, &rel_str).await {
+                                debug!("Failed to mark directory synced: {}", e);
+                            }
+                        }
+                        if let Some(p) = current.parent() {
+                            current = p;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -847,6 +919,13 @@ pub async fn handle_schema_change(
     // Check for directories that should be removed (empty after file deletions,
     // or directories that exist on disk but have no corresponding entries in schema)
     cleanup_orphaned_directories(directory, &schema).await;
+
+    // Unmark locally deleted directories from sync state so they don't keep being flagged
+    for dir_name in &locally_deleted_dirs {
+        if let Err(e) = unmark_directory_synced(directory, dir_name).await {
+            debug!("Failed to unmark deleted directory: {}", e);
+        }
+    }
 
     // Write nested schemas for node-backed directories to local subdirectories.
     // This persists subdirectory schemas so they survive server restarts.

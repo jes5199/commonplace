@@ -25,6 +25,10 @@ pub struct SyncStateFile {
     pub last_synced_at: Option<String>,
     /// Map of relative paths to file metadata
     pub files: HashMap<String, FileState>,
+    /// Set of directories that have been synced/created locally.
+    /// Used to distinguish "deleted locally" from "not yet synced".
+    #[serde(default)]
+    pub directories: std::collections::HashSet<String>,
 }
 
 /// State for a single file.
@@ -45,6 +49,7 @@ impl SyncStateFile {
             last_synced_cid: None,
             last_synced_at: None,
             files: HashMap::new(),
+            directories: std::collections::HashSet::new(),
         }
     }
 
@@ -120,6 +125,68 @@ impl SyncStateFile {
             None => true, // New file, not in saved state
         }
     }
+
+    /// Record that a directory has been synced/created locally.
+    pub fn add_directory(&mut self, relative_path: &str) {
+        self.directories.insert(relative_path.to_string());
+    }
+
+    /// Remove a directory from the tracked set (when deleted from schema).
+    pub fn remove_directory(&mut self, relative_path: &str) {
+        self.directories.remove(relative_path);
+    }
+
+    /// Check if a directory was previously synced/created locally.
+    ///
+    /// Returns true if the directory is tracked, meaning if it's missing
+    /// from disk, it was deleted by the user (not just never synced).
+    pub fn has_directory(&self, relative_path: &str) -> bool {
+        self.directories.contains(relative_path)
+    }
+}
+
+/// State file for tracking synced directories.
+/// Used to distinguish "deleted locally" from "not yet synced from server".
+const SYNCED_DIRS_FILENAME: &str = ".commonplace-synced-dirs.json";
+
+/// Load the set of synced directories from the state file.
+pub async fn load_synced_directories(directory: &Path) -> std::collections::HashSet<String> {
+    let state_path = directory.join(SYNCED_DIRS_FILENAME);
+    match fs::read_to_string(&state_path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// Save the set of synced directories to the state file.
+pub async fn save_synced_directories(
+    directory: &Path,
+    dirs: &std::collections::HashSet<String>,
+) -> io::Result<()> {
+    let state_path = directory.join(SYNCED_DIRS_FILENAME);
+    let content = serde_json::to_string_pretty(dirs)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&state_path, content).await
+}
+
+/// Add a directory to the synced set.
+pub async fn mark_directory_synced(directory: &Path, relative_path: &str) -> io::Result<()> {
+    let mut dirs = load_synced_directories(directory).await;
+    dirs.insert(relative_path.to_string());
+    save_synced_directories(directory, &dirs).await
+}
+
+/// Remove a directory from the synced set.
+pub async fn unmark_directory_synced(directory: &Path, relative_path: &str) -> io::Result<()> {
+    let mut dirs = load_synced_directories(directory).await;
+    dirs.remove(relative_path);
+    save_synced_directories(directory, &dirs).await
+}
+
+/// Check if a directory was previously synced.
+pub async fn is_directory_synced(directory: &Path, relative_path: &str) -> bool {
+    let dirs = load_synced_directories(directory).await;
+    dirs.contains(relative_path)
 }
 
 /// Compute SHA-256 hash of a file.

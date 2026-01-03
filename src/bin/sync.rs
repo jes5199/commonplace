@@ -330,6 +330,7 @@ async fn main() -> ExitCode {
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
         ignore_patterns.push(".pid".to_string());
+        ignore_patterns.push(".commonplace-synced-dirs.json".to_string());
 
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
@@ -382,6 +383,7 @@ async fn main() -> ExitCode {
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
         ignore_patterns.push(".commonplace-sync.lock".to_string()); // Ignore lock file
+        ignore_patterns.push(".commonplace-synced-dirs.json".to_string()); // Ignore synced dirs state
 
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
