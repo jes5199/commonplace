@@ -214,6 +214,18 @@ pub struct LogArgs {
     #[clap(long)]
     pub stat: bool,
 
+    /// Show diff/patch for each commit (default: on)
+    #[clap(short = 'p', short = 'u', long, default_value = "true", action = clap::ArgAction::SetTrue)]
+    pub patch: bool,
+
+    /// Suppress diff output (summary only)
+    #[clap(long)]
+    pub no_patch: bool,
+
+    /// Disable pager (output directly to terminal)
+    #[clap(long)]
+    pub no_pager: bool,
+
     /// Limit number of commits shown
     #[clap(short = 'n', long = "max-count")]
     pub max_count: Option<usize>,

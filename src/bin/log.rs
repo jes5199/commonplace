@@ -4,6 +4,7 @@
 //!   commonplace-log path/to/file.txt               # Full log output
 //!   commonplace-log --oneline path/to/file.txt     # Compact one-line format
 //!   commonplace-log --stat path/to/file.txt        # Show change statistics
+//!   commonplace-log -p path/to/file.txt            # Show diffs
 //!   commonplace-log -n 5 path/to/file.txt          # Limit to 5 commits
 //!   commonplace-log --since 2024-01-01 path.txt    # Commits after date
 
@@ -14,6 +15,8 @@ use commonplace_doc::workspace::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::io::{self, IsTerminal, Write};
+use std::process::{Command, Stdio};
 
 #[derive(Deserialize)]
 struct CommitChange {
@@ -113,9 +116,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Fetch diffs (default on, unless --no-patch or --oneline/--graph)
+    let show_patch = !args.no_patch && !args.oneline && !args.graph;
+    let diffs: Option<Vec<Option<String>>> = if show_patch {
+        Some(compute_diffs(&client, &args.server, &uuid, &changes.changes).await?)
+    } else {
+        None
+    };
+
+    // Build output string
+    let output = build_output(
+        &args,
+        &rel_path,
+        &uuid,
+        &changes.changes,
+        &stats_map,
+        &diffs,
+    )?;
+
+    // Use pager if interactive terminal and not disabled
+    if !args.no_pager && !args.json && io::stdout().is_terminal() {
+        output_with_pager(&output);
+    } else {
+        print!("{}", output);
+    }
+
+    Ok(())
+}
+
+fn build_output(
+    args: &LogArgs,
+    rel_path: &str,
+    uuid: &str,
+    changes: &[CommitChange],
+    stats_map: &Option<Vec<Option<ChangeStats>>>,
+    diffs: &Option<Vec<Option<String>>>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = String::new();
+
     if args.json {
         let commits: Vec<CommitInfo> = changes
-            .changes
             .iter()
             .enumerate()
             .map(|(i, c)| CommitInfo {
@@ -127,70 +167,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         let output = LogOutput {
-            uuid: uuid.clone(),
-            path: rel_path.clone(),
+            uuid: uuid.to_string(),
+            path: rel_path.to_string(),
             commits,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out.push_str(&serde_json::to_string_pretty(&output)?);
+        out.push('\n');
     } else if args.oneline {
-        // Compact one-line format: cid_short date message
-        for (i, change) in changes.changes.iter().enumerate() {
+        for (i, change) in changes.iter().enumerate() {
             let cid_short = &change.commit_id[..12.min(change.commit_id.len())];
             let date = format_timestamp_short(change.timestamp);
 
             if args.stat {
                 if let Some(ref stats_vec) = stats_map {
                     if let Some(Some(stats)) = stats_vec.get(i) {
-                        println!(
-                            "{} {} (+{} -{} chars)",
+                        out.push_str(&format!(
+                            "{} {} (+{} -{} chars)\n",
                             cid_short, date, stats.chars_added, stats.chars_removed
-                        );
+                        ));
                         continue;
                     }
                 }
             }
-            println!("{} {}", cid_short, date);
+            out.push_str(&format!("{} {}\n", cid_short, date));
         }
     } else if args.graph {
-        // ASCII graph view - for now just show a simple linear graph
-        // Full DAG graph support would require fetching parent info
-        print_graph_view(&changes.changes, stats_map.as_ref());
+        out.push_str(&build_graph_view(changes, stats_map.as_ref()));
     } else {
         // Full output (like git log)
-        println!("File: {}", rel_path);
-        println!("UUID: {}", uuid);
-        println!();
+        out.push_str(&format!("File: {}\n", rel_path));
+        out.push_str(&format!("UUID: {}\n", uuid));
+        out.push('\n');
 
-        for (i, change) in changes.changes.iter().enumerate() {
-            println!("commit {}", change.commit_id);
-            println!("Date:   {}", format_timestamp(change.timestamp));
+        for (i, change) in changes.iter().enumerate() {
+            out.push_str(&format!("\x1b[33mcommit {}\x1b[0m\n", change.commit_id));
+            out.push_str(&format!("Date:   {}\n", format_timestamp(change.timestamp)));
 
             if args.stat {
                 if let Some(ref stats_vec) = stats_map {
                     if let Some(Some(stats)) = stats_vec.get(i) {
-                        println!();
-                        println!(
-                            " {} chars (+{}/-{}), {} lines (+{}/-{})",
+                        out.push('\n');
+                        out.push_str(&format!(
+                            " {} chars (+{}/-{}), {} lines (+{}/-{})\n",
                             stats.chars_added + stats.chars_removed,
                             stats.chars_added,
                             stats.chars_removed,
                             stats.lines_added + stats.lines_removed,
                             stats.lines_added,
                             stats.lines_removed
-                        );
+                        ));
                     }
                 }
             }
-            println!();
+
+            // Show diff if available (default on, suppressed by --no-patch)
+            if let Some(ref diff_vec) = diffs {
+                if let Some(Some(diff)) = diff_vec.get(i) {
+                    if !diff.is_empty() {
+                        out.push('\n');
+                        out.push_str(&colorize_diff(diff));
+                    }
+                }
+            }
+
+            out.push('\n');
         }
 
-        println!("{} commits", changes.changes.len());
+        out.push_str(&format!("{} commits\n", changes.len()));
     }
 
-    Ok(())
+    Ok(out)
 }
 
-fn print_graph_view(changes: &[CommitChange], stats_map: Option<&Vec<Option<ChangeStats>>>) {
+fn colorize_diff(diff: &str) -> String {
+    let mut out = String::new();
+    for line in diff.lines() {
+        if line.starts_with('+') {
+            out.push_str(&format!("\x1b[32m{}\x1b[0m\n", line));
+        } else if line.starts_with('-') {
+            out.push_str(&format!("\x1b[31m{}\x1b[0m\n", line));
+        } else if line.starts_with("@@") {
+            out.push_str(&format!("\x1b[36m{}\x1b[0m\n", line));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn output_with_pager(output: &str) {
+    // Try PAGER env var, then less, then more
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+
+    // Build pager command with -R for color support
+    let mut cmd = if pager.contains("less") {
+        let mut c = Command::new(&pager);
+        c.arg("-R"); // Enable raw control codes for colors
+        c
+    } else {
+        Command::new(&pager)
+    };
+
+    match cmd.stdin(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(output.as_bytes());
+            }
+            let _ = child.wait();
+        }
+        Err(_) => {
+            // Fall back to direct output
+            print!("{}", output);
+        }
+    }
+}
+
+fn build_graph_view(
+    changes: &[CommitChange],
+    stats_map: Option<&Vec<Option<ChangeStats>>>,
+) -> String {
+    let mut out = String::new();
     // Simple linear graph - for now we don't have parent info
     // Full graph would need to fetch commit parents from server
     for (i, change) in changes.iter().enumerate() {
@@ -200,19 +297,23 @@ fn print_graph_view(changes: &[CommitChange], stats_map: Option<&Vec<Option<Chan
 
         let connector = if is_last { "  " } else { "| " };
 
-        print!("* {} {}", cid_short, date);
+        out.push_str(&format!("* {} {}", cid_short, date));
 
         if let Some(stats_vec) = stats_map {
             if let Some(Some(stats)) = stats_vec.get(i) {
-                print!(" (+{} -{} chars)", stats.chars_added, stats.chars_removed);
+                out.push_str(&format!(
+                    " (+{} -{} chars)",
+                    stats.chars_added, stats.chars_removed
+                ));
             }
         }
-        println!();
+        out.push('\n');
 
         if !is_last {
-            println!("{}", connector);
+            out.push_str(&format!("{}\n", connector));
         }
     }
+    out
 }
 
 async fn compute_stats(
@@ -302,4 +403,105 @@ fn compute_diff_stats(old: &str, new: &str) -> ChangeStats {
         chars_added,
         chars_removed,
     }
+}
+
+async fn compute_diffs(
+    client: &Client,
+    server: &str,
+    uuid: &str,
+    changes: &[CommitChange],
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    let mut result = Vec::with_capacity(changes.len());
+
+    // We need content at each commit and the previous one to compute diffs
+    let mut prev_content: Option<String> = None;
+
+    // Sort by timestamp to process chronologically (oldest first)
+    let mut sorted_indices: Vec<usize> = (0..changes.len()).collect();
+    sorted_indices.sort_by_key(|&i| changes[i].timestamp);
+
+    // Map from original index to diff
+    let mut diffs_by_index: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+
+    for &orig_idx in &sorted_indices {
+        let change = &changes[orig_idx];
+        let url = format!(
+            "{}/docs/{}/head?at_commit={}",
+            server, uuid, change.commit_id
+        );
+
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(head) = resp.json::<HeadResponse>().await {
+                    if let Some(content) = head.content {
+                        let diff = if let Some(ref prev) = prev_content {
+                            compute_unified_diff(prev, &content)
+                        } else {
+                            // First commit - show all as additions
+                            content
+                                .lines()
+                                .map(|l| format!("+{}", l))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        diffs_by_index.insert(orig_idx, diff);
+                        prev_content = Some(content);
+                    }
+                }
+            }
+            _ => {
+                // Skip commits we can't fetch
+            }
+        }
+    }
+
+    // Build result in original order (newest first)
+    for i in 0..changes.len() {
+        result.push(diffs_by_index.remove(&i));
+    }
+
+    Ok(result)
+}
+
+fn compute_unified_diff(old: &str, new: &str) -> String {
+    // Simple unified diff format
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    let mut out = String::new();
+
+    // Find lines that changed
+    let old_set: std::collections::HashSet<&str> = old_lines.iter().copied().collect();
+    let new_set: std::collections::HashSet<&str> = new_lines.iter().copied().collect();
+
+    let removed: Vec<&str> = old_lines
+        .iter()
+        .filter(|l| !new_set.contains(*l))
+        .copied()
+        .collect();
+    let added: Vec<&str> = new_lines
+        .iter()
+        .filter(|l| !old_set.contains(*l))
+        .copied()
+        .collect();
+
+    if !removed.is_empty() || !added.is_empty() {
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            1,
+            old_lines.len(),
+            1,
+            new_lines.len()
+        ));
+
+        for line in &removed {
+            out.push_str(&format!("-{}\n", line));
+        }
+        for line in &added {
+            out.push_str(&format!("+{}\n", line));
+        }
+    }
+
+    out
 }
