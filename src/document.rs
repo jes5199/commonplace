@@ -194,12 +194,16 @@ impl DocumentStore {
                             .map_err(|e| ApplyError::Serialization(e.to_string()))?;
                         // Convert to JSONL: one JSON object per line
                         if let serde_json::Value::Array(items) = json_value {
-                            items
+                            let mut content = items
                                 .iter()
                                 .map(serde_json::to_string)
                                 .collect::<Result<Vec<_>, _>>()
                                 .map(|lines| lines.join("\n"))
-                                .map_err(|e| ApplyError::Serialization(e.to_string()))?
+                                .map_err(|e| ApplyError::Serialization(e.to_string()))?;
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content
                         } else {
                             ContentType::Jsonl.default_content()
                         }
