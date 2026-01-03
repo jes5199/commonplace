@@ -173,3 +173,13 @@ pub struct UuidArgs {
     #[clap(long)]
     pub json: bool,
 }
+
+/// CLI arguments for commonplace-ps (list orchestrator processes)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-ps")]
+#[clap(about = "List processes managed by the commonplace orchestrator", long_about = None)]
+pub struct PsArgs {
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}

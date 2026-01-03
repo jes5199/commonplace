@@ -43,6 +43,10 @@ path = "src/bin/link.rs"
 name = "commonplace-uuid"
 path = "src/bin/uuid.rs"
 
+[[bin]]
+name = "commonplace-ps"
+path = "src/bin/ps.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"

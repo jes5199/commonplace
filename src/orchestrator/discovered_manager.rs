@@ -5,6 +5,7 @@
 //! see the `discovery` module.
 
 use super::discovery::{DiscoveredProcess, ProcessesConfig};
+use super::status::{OrchestratorStatus, ProcessStatus};
 use futures::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event as SseEvent, EventSource};
@@ -94,6 +95,45 @@ impl DiscoveredProcessManager {
         &self.processes
     }
 
+    /// Write current process status to the status file.
+    /// Called when processes start, stop, or change state.
+    pub fn write_status(&self) {
+        let mut status = OrchestratorStatus::new();
+
+        for (name, process) in &self.processes {
+            let pid = process.handle.as_ref().and_then(|h| h.id());
+
+            let cwd = process
+                .config
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string());
+
+            let state = match process.state {
+                DiscoveredProcessState::Stopped => "Stopped",
+                DiscoveredProcessState::Starting => "Starting",
+                DiscoveredProcessState::Running => "Running",
+                DiscoveredProcessState::Failed => "Failed",
+            };
+
+            status.processes.push(ProcessStatus {
+                name: name.clone(),
+                pid,
+                cwd,
+                state: state.to_string(),
+                document_path: Some(process.document_path.clone()),
+                source_path: Some(process.source_path.clone()),
+            });
+        }
+
+        // Sort by name for consistent output
+        status.processes.sort_by(|a, b| a.name.cmp(&b.name));
+
+        if let Err(e) = status.write() {
+            tracing::warn!("[discovery] Failed to write status file: {}", e);
+        }
+    }
+
     /// Add a process to be managed.
     ///
     /// # Arguments
@@ -150,6 +190,8 @@ impl DiscoveredProcessManager {
                     let _ = child.kill().await;
                 }
             }
+            // Update status after removing process
+            self.write_status();
             Some(process)
         } else {
             None
@@ -282,6 +324,9 @@ impl DiscoveredProcessManager {
         process.state = DiscoveredProcessState::Running;
         process.last_start = Some(Instant::now());
 
+        // Update status file
+        self.write_status();
+
         Ok(())
     }
 
@@ -293,6 +338,8 @@ impl DiscoveredProcessManager {
             // Small delay between starts
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // Write final status after all started
+        self.write_status();
         Ok(())
     }
 
@@ -316,6 +363,7 @@ impl DiscoveredProcessManager {
                                 status
                             );
                             process.handle = None;
+                            process.state = DiscoveredProcessState::Failed;
                             true // Always restart discovered processes
                         }
                         Ok(None) => {
@@ -356,6 +404,9 @@ impl DiscoveredProcessManager {
                         self.max_backoff_ms,
                     )
                 };
+
+                // Update status to reflect the failed state
+                self.write_status();
 
                 let failures = self.processes.get(&name).unwrap().consecutive_failures;
                 tracing::info!(
@@ -1056,6 +1107,11 @@ impl DiscoveredProcessManager {
                     process.state = DiscoveredProcessState::Stopped;
                 }
             }
+        }
+
+        // Remove status file on shutdown
+        if let Err(e) = OrchestratorStatus::remove() {
+            tracing::warn!("[discovery] Failed to remove status file: {}", e);
         }
 
         tracing::info!("[discovery] Shutdown complete");
