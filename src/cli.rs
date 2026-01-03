@@ -194,6 +194,71 @@ pub struct ReplayArgs {
     pub json: bool,
 }
 
+/// CLI arguments for commonplace-log (git-log style commit history)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-log")]
+#[clap(about = "Show commit history for a synced file (like git log)", long_about = None)]
+pub struct LogArgs {
+    /// File path to view history for (relative or absolute)
+    pub path: PathBuf,
+
+    /// Show one commit per line (compact format)
+    #[clap(long)]
+    pub oneline: bool,
+
+    /// Show ASCII graph of commit ancestry (for branching history)
+    #[clap(long)]
+    pub graph: bool,
+
+    /// Show change statistics (lines added/removed)
+    #[clap(long)]
+    pub stat: bool,
+
+    /// Limit number of commits shown
+    #[clap(short = 'n', long = "max-count")]
+    pub max_count: Option<usize>,
+
+    /// Show commits after this date (YYYY-MM-DD or timestamp)
+    #[clap(long)]
+    pub since: Option<String>,
+
+    /// Show commits before this date (YYYY-MM-DD or timestamp)
+    #[clap(long)]
+    pub until: Option<String>,
+
+    /// Server URL
+    #[clap(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
+
+/// CLI arguments for commonplace-show (git-show style content display)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-show")]
+#[clap(about = "Show content at a specific commit (like git show)", long_about = None)]
+pub struct ShowArgs {
+    /// File path to view (relative or absolute)
+    pub path: PathBuf,
+
+    /// Commit ID to show (default: HEAD)
+    pub commit: Option<String>,
+
+    /// Show change statistics for the commit
+    #[clap(long)]
+    pub stat: bool,
+
+    /// Server URL
+    #[clap(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
+
 /// CLI arguments for commonplace-signal (signal orchestrator process)
 #[derive(Parser, Debug)]
 #[clap(name = "commonplace-signal")]

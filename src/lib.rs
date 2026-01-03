@@ -16,6 +16,7 @@ pub mod services;
 pub mod sse;
 pub mod store;
 pub mod sync;
+pub mod workspace;
 
 use axum::{routing::get, Router};
 use content_type::ContentType;
