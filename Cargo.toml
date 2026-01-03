@@ -51,6 +51,10 @@ path = "src/bin/ps.rs"
 name = "commonplace-signal"
 path = "src/bin/signal.rs"
 
+[[bin]]
+name = "commonplace-replay"
+path = "src/bin/replay.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"

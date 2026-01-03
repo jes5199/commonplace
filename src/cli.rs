@@ -184,6 +184,31 @@ pub struct PsArgs {
     pub json: bool,
 }
 
+/// CLI arguments for commonplace-replay (view/replay file edits)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-replay")]
+#[clap(about = "View or replay edit history for a synced file", long_about = None)]
+pub struct ReplayArgs {
+    /// File path to view history for (relative or absolute)
+    pub path: PathBuf,
+
+    /// List commits only (don't show content)
+    #[clap(long)]
+    pub list: bool,
+
+    /// Show content at a specific commit
+    #[clap(long)]
+    pub at: Option<String>,
+
+    /// Server URL
+    #[clap(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
+
 /// CLI arguments for commonplace-signal (signal orchestrator process)
 #[derive(Parser, Debug)]
 #[clap(name = "commonplace-signal")]

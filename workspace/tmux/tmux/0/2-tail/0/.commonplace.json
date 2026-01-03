@@ -3,14 +3,14 @@
   "root": {
     "type": "dir",
     "entries": {
-      "input.txt": {
-        "type": "doc",
-        "node_id": "c726821f-1391-46d7-9f20-e2a3b1d8945e",
-        "content_type": "text/plain"
-      },
       "content.txt": {
         "type": "doc",
-        "node_id": "7d8de232-6fd6-42da-aa88-531cf49ff77d",
+        "node_id": "3720045b-543f-4b49-ba2a-a3fbddf49edb",
+        "content_type": "text/plain"
+      },
+      "input.txt": {
+        "type": "doc",
+        "node_id": "8f86d4ec-cd60-43c7-92bb-fedf8eb6d192",
         "content_type": "text/plain"
       }
     },

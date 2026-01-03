@@ -81,6 +81,16 @@ commonplace-uuid path/to/file.txt
 commonplace-uuid --json path/to/file.txt  # JSON output
 ```
 
+### commonplace-replay
+
+View commit history or content at any point in time:
+
+```bash
+commonplace-replay path/to/file.txt --list           # List commits
+commonplace-replay path/to/file.txt                  # Show current content
+commonplace-replay path/to/file.txt --at <commit>    # Content at commit
+```
+
 ### commonplace-signal
 
 Send a signal to an orchestrator-managed process:

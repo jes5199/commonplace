@@ -5,12 +5,12 @@
     "entries": {
       "input.txt": {
         "type": "doc",
-        "node_id": "d7e7f8c7-218f-4fc6-8c1a-10746ead52b7",
+        "node_id": "c5987cbd-f9ee-4463-a5a3-dcae1b66d80f",
         "content_type": "text/plain"
       },
       "content.txt": {
         "type": "doc",
-        "node_id": "e107375b-d0a4-46bc-a698-7ded53c29f08",
+        "node_id": "924965cb-0b6b-4c1a-bcdd-ed2ff414063b",
         "content_type": "text/plain"
       }
     },
