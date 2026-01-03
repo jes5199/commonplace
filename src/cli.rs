@@ -160,3 +160,16 @@ pub struct LinkArgs {
     #[clap(short, long, default_value = "http://localhost:3000")]
     pub server: String,
 }
+
+/// CLI arguments for commonplace-uuid (resolve path to UUID)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-uuid")]
+#[clap(about = "Resolve a synced file path to its UUID", long_about = None)]
+pub struct UuidArgs {
+    /// File path to resolve (relative or absolute)
+    pub path: PathBuf,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
