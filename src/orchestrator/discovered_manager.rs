@@ -953,28 +953,29 @@ impl DiscoveredProcessManager {
             discovery.schema_node_ids.len()
         );
 
+        // Track watched documents: node_id -> base_path
+        // Only successfully loaded processes.json files are added to this map
+        let mut watched: HashMap<String, String> = HashMap::new();
+
         // Fetch and reconcile each processes.json
         for (base_path, pj_node_id) in &discovery.processes_json_files {
             let url = format!("{}/docs/{}/head", self.server_url, pj_node_id);
             match self.fetch_and_reconcile(client, &url, base_path).await {
-                Ok(_) => tracing::info!(
-                    "[discovery] Loaded processes from {}/processes.json",
-                    base_path
-                ),
+                Ok(_) => {
+                    tracing::info!(
+                        "[discovery] Loaded processes from {}/processes.json",
+                        base_path
+                    );
+                    // Only add to watched if successfully loaded
+                    watched.insert(pj_node_id.clone(), base_path.clone());
+                }
                 Err(e) => tracing::warn!(
-                    "[discovery] Failed to load {}/processes.json: {}",
+                    "[discovery] Failed to load {}/processes.json: {} (will retry)",
                     base_path,
                     e
                 ),
             }
         }
-
-        // Track watched documents: node_id -> base_path
-        let mut watched: HashMap<String, String> = discovery
-            .processes_json_files
-            .iter()
-            .map(|(base_path, node_id)| (node_id.clone(), base_path.clone()))
-            .collect();
 
         // Track current schema node_ids for detecting new directories
         let mut current_schema_ids: HashSet<String> =
@@ -1040,15 +1041,21 @@ impl DiscoveredProcessManager {
                     _ = discovery_interval.tick() => {
                         match Self::discover_all_processes_json(client, &self.server_url, fs_root_id).await {
                             Ok(new_discovery) => {
-                                // Check for new processes.json files
+                                // Check for new or previously-failed processes.json files
                                 for (base_path, node_id) in &new_discovery.processes_json_files {
                                     if !watched.contains_key(node_id) {
-                                        tracing::info!("[discovery] Found new processes.json at {}", base_path);
+                                        tracing::info!("[discovery] Trying processes.json at {}", base_path);
                                         let url = format!("{}/docs/{}/head", self.server_url, node_id);
-                                        if let Err(e) = self.fetch_and_reconcile(client, &url, base_path).await {
-                                            tracing::warn!("[discovery] Failed to load {}: {}", base_path, e);
+                                        match self.fetch_and_reconcile(client, &url, base_path).await {
+                                            Ok(_) => {
+                                                tracing::info!("[discovery] Loaded processes from {}/processes.json", base_path);
+                                                // Only add to watched if successfully loaded
+                                                watched.insert(node_id.clone(), base_path.clone());
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("[discovery] Failed to load {}: {} (will retry)", base_path, e);
+                                            }
                                         }
-                                        watched.insert(node_id.clone(), base_path.clone());
                                     }
                                 }
 

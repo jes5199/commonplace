@@ -143,10 +143,66 @@ async fn main() {
         tracing::info!("[orchestrator] Recursive discovery mode");
         tracing::info!("[orchestrator] Server: {}", args.server);
 
+        // First, start server and sync from commonplace.json using ProcessManager
+        // This ensures the server is running before we try to discover processes
+        let mut base_manager = ProcessManager::new(
+            config.clone(),
+            args.mqtt_broker.clone(),
+            args.disable.clone(),
+        );
+
+        // Start server first (and any processes it depends on)
+        if config.processes.contains_key("server") {
+            tracing::info!("[orchestrator] Starting server from config...");
+            if let Err(e) = base_manager.spawn_process("server").await {
+                tracing::error!("[orchestrator] Failed to start server: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        // Wait for server to be healthy
+        let client = reqwest::Client::new();
+        let health_url = format!("{}/health", args.server);
+        tracing::info!("[orchestrator] Waiting for server to be healthy...");
+        let mut attempts = 0;
+        loop {
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("[orchestrator] Server is healthy");
+                    break;
+                }
+                _ => {
+                    attempts += 1;
+                    if attempts > 30 {
+                        tracing::error!(
+                            "[orchestrator] Server failed to become healthy after 30 attempts"
+                        );
+                        base_manager.shutdown().await;
+                        std::process::exit(1);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        // Start sync if configured (to push initial content to server)
+        if config.processes.contains_key("sync") {
+            tracing::info!("[orchestrator] Starting sync from config...");
+            if let Err(e) = base_manager.spawn_process("sync").await {
+                tracing::error!("[orchestrator] Failed to start sync: {}", e);
+                base_manager.shutdown().await;
+                std::process::exit(1);
+            }
+
+            // Give sync time to push initial content
+            // TODO: CP-bxv - sync should signal when initial push is complete
+            tracing::info!("[orchestrator] Waiting for sync to push initial content...");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+
+        // Now we can start recursive discovery
         let mut discovered_manager =
             DiscoveredProcessManager::new(broker_raw.to_string(), args.server.clone());
-
-        let client = reqwest::Client::new();
 
         // Get fs-root ID from server
         let fs_root_url = format!("{}/fs-root", args.server);
@@ -160,6 +216,7 @@ async fn main() {
                     Ok(r) => r.id,
                     Err(e) => {
                         tracing::error!("[orchestrator] Failed to parse fs-root response: {}", e);
+                        base_manager.shutdown().await;
                         std::process::exit(1);
                     }
                 }
@@ -170,10 +227,12 @@ async fn main() {
                     resp.status()
                 );
                 tracing::error!("[orchestrator] Make sure server was started with --fs-root");
+                base_manager.shutdown().await;
                 std::process::exit(1);
             }
             Err(e) => {
                 tracing::error!("[orchestrator] Failed to connect to server: {}", e);
+                base_manager.shutdown().await;
                 std::process::exit(1);
             }
         };
@@ -181,18 +240,27 @@ async fn main() {
         tracing::info!("[orchestrator] Using fs-root: {}", fs_root_id);
 
         // Run the recursive watcher with shutdown handling
+        // Also monitor base processes (server, sync) for restarts
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(500));
         tokio::select! {
             result = discovered_manager.run_with_recursive_watch(&client, &fs_root_id) => {
                 if let Err(e) = result {
                     tracing::error!("[orchestrator] Recursive watch failed: {}", e);
                 }
             }
+            _ = async {
+                loop {
+                    monitor_interval.tick().await;
+                    base_manager.check_and_restart().await;
+                }
+            } => {}
             _ = wait_for_shutdown_signal() => {
                 tracing::info!("[orchestrator] Shutting down...");
             }
         }
 
         discovered_manager.shutdown().await;
+        base_manager.shutdown().await;
         return;
     }
 
