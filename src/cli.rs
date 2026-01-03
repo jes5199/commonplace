@@ -101,24 +101,9 @@ pub struct OrchestratorArgs {
     #[clap(long, value_name = "NAME")]
     pub only: Option<String>,
 
-    /// Watch a .processes.json document for dynamic process management
-    /// When specified, processes are started/stopped based on document changes
-    #[clap(long, value_name = "DOC_PATH")]
-    pub watch_processes: Option<String>,
-
-    /// HTTP server URL for document fetching (used with --watch-processes)
+    /// HTTP server URL for recursive process discovery
     #[clap(long, value_name = "URL", default_value = "http://localhost:3000")]
     pub server: String,
-
-    /// Use path-based endpoints instead of document IDs (used with --watch-processes)
-    #[clap(long)]
-    pub use_paths: bool,
-
-    /// Recursively discover all processes.json files in the filesystem tree
-    /// Uses --server's fs-root as the starting point (default: true)
-    /// Use --no-recursive to use static config file instead
-    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub recursive: bool,
 }
 
 /// CLI arguments for commonplace-cmd (send commands to paths)
