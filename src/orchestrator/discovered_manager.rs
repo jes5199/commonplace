@@ -111,11 +111,22 @@ impl DiscoveredProcessManager {
         for (name, process) in &self.processes {
             let pid = process.handle.as_ref().and_then(|h| h.id());
 
+            // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
             let cwd = process
                 .config
                 .cwd
                 .as_ref()
-                .map(|p| p.to_string_lossy().to_string());
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| {
+                    // For sandbox-exec processes, read actual cwd from /proc
+                    #[cfg(target_os = "linux")]
+                    if let Some(p) = pid {
+                        if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", p)) {
+                            return Some(link.to_string_lossy().to_string());
+                        }
+                    }
+                    None
+                });
 
             let state = match process.state {
                 DiscoveredProcessState::Stopped => "Stopped",

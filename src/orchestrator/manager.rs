@@ -1,3 +1,4 @@
+use super::status::{OrchestratorStatus, ProcessStatus};
 use super::{OrchestratorConfig, ProcessConfig, RestartMode};
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -67,6 +68,55 @@ impl ProcessManager {
         self.mqtt_broker_override
             .as_deref()
             .unwrap_or(&self.config.mqtt_broker)
+    }
+
+    /// Write current process status to the status file.
+    pub fn write_status(&self) {
+        let mut status = OrchestratorStatus::new();
+
+        for (name, process) in &self.processes {
+            let pid = process.handle.as_ref().and_then(|h| h.id());
+
+            // Try to get CWD from config first, otherwise read from /proc/<pid>/cwd
+            let cwd = process
+                .config
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| {
+                    // For processes without explicit cwd, read actual cwd from /proc
+                    #[cfg(target_os = "linux")]
+                    if let Some(p) = pid {
+                        if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", p)) {
+                            return Some(link.to_string_lossy().to_string());
+                        }
+                    }
+                    None
+                });
+
+            let state = match process.state {
+                ProcessState::Stopped => "Stopped",
+                ProcessState::Starting => "Starting",
+                ProcessState::Running => "Running",
+                ProcessState::Failed => "Failed",
+            };
+
+            status.processes.push(ProcessStatus {
+                name: name.clone(),
+                pid,
+                cwd,
+                state: state.to_string(),
+                document_path: None,
+                source_path: None,
+            });
+        }
+
+        // Sort by name for consistent output
+        status.processes.sort_by(|a, b| a.name.cmp(&b.name));
+
+        if let Err(e) = status.write() {
+            tracing::warn!("[orchestrator] Failed to write status file: {}", e);
+        }
     }
 
     pub async fn spawn_process(&mut self, name: &str) -> Result<(), String> {
@@ -154,6 +204,9 @@ impl ProcessManager {
         process.handle = Some(child);
         process.state = ProcessState::Running;
         process.last_start = Some(Instant::now());
+
+        // Update status file
+        self.write_status();
 
         Ok(())
     }
@@ -350,21 +403,27 @@ impl ProcessManager {
             };
 
             if should_restart {
-                let process = self.processes.get_mut(&name).unwrap();
-                process.consecutive_failures += 1;
-                process.state = ProcessState::Failed;
+                let (backoff, failures) = {
+                    let process = self.processes.get_mut(&name).unwrap();
+                    process.consecutive_failures += 1;
+                    process.state = ProcessState::Failed;
 
-                let backoff = std::cmp::min(
-                    process.config.restart.backoff_ms
-                        * 2u64.pow(process.consecutive_failures.saturating_sub(1)),
-                    process.config.restart.max_backoff_ms,
-                );
+                    let backoff = std::cmp::min(
+                        process.config.restart.backoff_ms
+                            * 2u64.pow(process.consecutive_failures.saturating_sub(1)),
+                        process.config.restart.max_backoff_ms,
+                    );
+                    (backoff, process.consecutive_failures)
+                };
+
+                // Update status to reflect the failed state
+                self.write_status();
 
                 tracing::info!(
                     "[orchestrator] Restarting '{}' in {}ms (attempt {})",
                     name,
                     backoff,
-                    process.consecutive_failures
+                    failures
                 );
 
                 tokio::time::sleep(Duration::from_millis(backoff)).await;
@@ -433,6 +492,11 @@ impl ProcessManager {
                     process.state = ProcessState::Stopped;
                 }
             }
+        }
+
+        // Remove status file on shutdown
+        if let Err(e) = OrchestratorStatus::remove() {
+            tracing::warn!("[orchestrator] Failed to remove status file: {}", e);
         }
 
         tracing::info!("[orchestrator] Shutdown complete");

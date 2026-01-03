@@ -55,10 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", "-".repeat(80));
 
             for proc in &status.processes {
-                let pid_str = proc
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
+                // Check if the PID is still running
+                let (pid_str, state_display) = if let Some(pid) = proc.pid {
+                    if is_process_running(pid) {
+                        (pid.to_string(), proc.state.clone())
+                    } else {
+                        // Process has died but status file wasn't updated
+                        (format!("{}!", pid), "Dead".to_string())
+                    }
+                } else {
+                    ("-".to_string(), proc.state.clone())
+                };
+
                 let cwd = proc.cwd.as_deref().unwrap_or("-");
 
                 // Truncate cwd if too long
@@ -70,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!(
                     "{:<20} {:>8} {:<10} {:<40}",
-                    proc.name, pid_str, proc.state, cwd_display
+                    proc.name, pid_str, state_display, cwd_display
                 );
             }
         }
