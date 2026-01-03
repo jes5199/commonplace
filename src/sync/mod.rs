@@ -1,5 +1,11 @@
 //! Sync utilities for directory synchronization.
 
+use fs2::FileExt;
+use std::fs::File;
+use std::io;
+use std::path::Path;
+use tracing::{error, info};
+
 pub mod client;
 pub mod content_type;
 pub mod dir_sync;
@@ -12,6 +18,39 @@ pub mod types;
 pub mod urls;
 pub mod watcher;
 pub mod yjs;
+
+/// Lock file name for sync process
+const SYNC_LOCK_FILENAME: &str = ".commonplace-sync.lock";
+
+/// Acquires an exclusive lock on the sync directory to prevent multiple sync instances.
+/// Returns the lock file handle which must be kept alive for the duration of the sync.
+/// If the lock cannot be acquired, returns an error.
+pub fn acquire_sync_lock(directory: &Path) -> io::Result<File> {
+    let lock_path = directory.join(SYNC_LOCK_FILENAME);
+    let lock_file = File::create(&lock_path)?;
+
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {
+            info!("Acquired sync lock for directory: {}", directory.display());
+            Ok(lock_file)
+        }
+        Err(e) => {
+            error!(
+                "Another sync process is already running for directory {}: {}",
+                directory.display(),
+                e
+            );
+            error!("Only one sync instance can run per checkout");
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Another sync is already running for {}",
+                    directory.display()
+                ),
+            ))
+        }
+    }
+}
 
 pub use client::{
     fork_node, push_file_content, push_json_content, push_jsonl_content, push_schema_to_server,

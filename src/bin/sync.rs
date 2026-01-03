@@ -7,11 +7,11 @@
 use clap::Parser;
 use commonplace_doc::sync::state_file::{compute_content_hash, SyncStateFile};
 use commonplace_doc::sync::{
-    build_replace_url, build_uuid_map_recursive, check_server_has_content, detect_from_path,
-    directory_sse_task, directory_watcher_task, encode_node_id, ensure_fs_root_exists,
-    file_watcher_task, fork_node, get_all_node_backed_dir_ids, handle_file_created,
-    handle_file_deleted, handle_file_modified, handle_schema_change, initial_sync,
-    is_binary_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
+    acquire_sync_lock, build_replace_url, build_uuid_map_recursive, check_server_has_content,
+    detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
+    ensure_fs_root_exists, file_watcher_task, fork_node, get_all_node_backed_dir_ids,
+    handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
+    initial_sync, is_binary_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
     subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent,
     FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
@@ -369,9 +369,19 @@ async fn main() -> ExitCode {
 
         exec_result
     } else if let Some(directory) = args.directory {
+        // Acquire sync lock for this directory (non-sandbox mode)
+        let _sync_lock = match acquire_sync_lock(&directory) {
+            Ok(lock) => lock,
+            Err(e) => {
+                error!("Failed to acquire sync lock: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+
         // Always ignore the schema file (.commonplace.json) when scanning
         let mut ignore_patterns = args.ignore;
         ignore_patterns.push(SCHEMA_FILENAME.to_string());
+        ignore_patterns.push(".commonplace-sync.lock".to_string()); // Ignore lock file
 
         let scan_options = ScanOptions {
             include_hidden: args.include_hidden,
