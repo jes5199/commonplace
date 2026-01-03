@@ -25,6 +25,16 @@ pub const BARRIER_RETRY_COUNT: u32 = 5;
 /// Delay between retries when checking for stable content
 pub const BARRIER_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// Ensures text content ends with a trailing newline.
+/// This is important for text files (especially JSON) to maintain proper formatting.
+fn ensure_trailing_newline(content: &str) -> String {
+    if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{}\n", content)
+    }
+}
+
 /// Task that handles file changes and uploads to server
 pub async fn upload_task(
     client: Client,
@@ -498,7 +508,9 @@ pub async fn initial_sync(
         }
     } else {
         // Extension says text, content doesn't look like base64 binary
-        let bytes = head.content.as_bytes().to_vec();
+        // Ensure text files end with a trailing newline
+        let content_with_newline = ensure_trailing_newline(&head.content);
+        let bytes = content_with_newline.as_bytes().to_vec();
         tokio::fs::write(file_path, &bytes).await?;
         bytes
     };
@@ -695,7 +707,9 @@ pub async fn sync_single_file(
                             tokio::fs::write(file_path, &decoded).await?;
                         }
                     } else {
-                        tokio::fs::write(file_path, &head.content).await?;
+                        // Ensure text files end with a trailing newline
+                        let content_with_newline = ensure_trailing_newline(&head.content);
+                        tokio::fs::write(file_path, content_with_newline).await?;
                     }
                     // Seed SyncState with server content after pull
                     let mut s = state.write().await;
