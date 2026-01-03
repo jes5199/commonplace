@@ -255,7 +255,11 @@ pub fn yjs_array_to_jsonl(state_b64: &str) -> Result<String, Box<dyn std::error:
         }
     }
 
-    Ok(lines.join("\n"))
+    let mut content = lines.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    Ok(content)
 }
 
 /// Convert yrs::Any to serde_json::Value
