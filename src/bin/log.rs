@@ -208,7 +208,12 @@ fn build_output(
             ));
         }
     } else if graph {
-        out.push_str(&build_graph_view(changes, stats_map.as_ref(), decorate));
+        out.push_str(&build_graph_view(
+            changes,
+            stats_map.as_ref(),
+            diffs.as_ref(),
+            decorate,
+        ));
     } else {
         // Full output (like git log)
         out.push_str(&format!("File: {}\n", rel_path));
@@ -310,6 +315,7 @@ fn output_with_pager(output: &str) {
 fn build_graph_view(
     changes: &[CommitChange],
     stats_map: Option<&Vec<Option<ChangeStats>>>,
+    diffs: Option<&Vec<Option<String>>>,
     decorate: bool,
 ) -> String {
     let mut out = String::new();
@@ -341,6 +347,17 @@ fn build_graph_view(
             }
         }
         out.push('\n');
+
+        // Show diff if available
+        if let Some(diff_vec) = diffs {
+            if let Some(Some(diff)) = diff_vec.get(i) {
+                if !diff.is_empty() {
+                    for line in colorize_diff(diff).lines() {
+                        out.push_str(&format!("{} {}\n", connector, line));
+                    }
+                }
+            }
+        }
 
         if !is_last {
             out.push_str(&format!("{}\n", connector));
