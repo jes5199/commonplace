@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "0": {
+        "type": "dir",
+        "entries": null,
+        "node_id": "b27c8b5d-1df9-4445-ba52-9884f8e82042",
+        "content_type": "application/json"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

@@ -164,6 +164,21 @@ commonplace-uuid path/to/file.txt
 commonplace-uuid --json path/to/file.txt
 ```
 
+#### commonplace-signal
+
+Send a signal to an orchestrator-managed process:
+
+```bash
+# Send SIGTERM (default) to restart a process
+commonplace-signal -n bartleby
+
+# Send specific signal
+commonplace-signal -n sync -s KILL
+
+# Filter by document path when multiple processes have same name
+commonplace-signal -n sync -p /text-to-telegram
+```
+
 #### commonplace-link
 
 Link two files to share the same UUID (see "File Linking" section below).

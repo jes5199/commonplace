@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "root": {
+    "type": "dir",
+    "entries": {
+      "input.txt": {
+        "type": "doc",
+        "node_id": "c84a01de-a379-4823-a739-7e016fa621f9",
+        "content_type": "text/plain"
+      },
+      "content.txt": {
+        "type": "doc",
+        "node_id": "4191c9ee-8ffa-4079-876a-66dea4264ccd",
+        "content_type": "text/plain"
+      }
+    },
+    "node_id": null,
+    "content_type": null
+  }
+}

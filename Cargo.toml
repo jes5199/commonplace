@@ -47,6 +47,10 @@ path = "src/bin/uuid.rs"
 name = "commonplace-ps"
 path = "src/bin/ps.rs"
 
+[[bin]]
+name = "commonplace-signal"
+path = "src/bin/signal.rs"
+
 [dependencies]
 rmcp = { version = "0.12", features = ["server", "transport-io"] }
 axum = "0.7"

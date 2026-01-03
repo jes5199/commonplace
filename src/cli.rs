@@ -183,3 +183,25 @@ pub struct PsArgs {
     #[clap(long)]
     pub json: bool,
 }
+
+/// CLI arguments for commonplace-signal (signal orchestrator process)
+#[derive(Parser, Debug)]
+#[clap(name = "commonplace-signal")]
+#[clap(about = "Send a signal to an orchestrator-managed process", long_about = None)]
+pub struct SignalArgs {
+    /// Process name to signal
+    #[clap(long, short)]
+    pub name: String,
+
+    /// Filter by document path (optional)
+    #[clap(long, short)]
+    pub path: Option<String>,
+
+    /// Signal to send (default: TERM)
+    #[clap(long, short, default_value = "TERM")]
+    pub signal: String,
+
+    /// Output in JSON format
+    #[clap(long)]
+    pub json: bool,
+}
