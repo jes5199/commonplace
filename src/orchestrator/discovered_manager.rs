@@ -118,9 +118,23 @@ impl DiscoveredProcessManager {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .or_else(|| {
-                    // For sandbox-exec processes, read actual cwd from /proc
+                    // For sandbox-exec processes, we need the child's CWD, not the wrapper's
                     #[cfg(target_os = "linux")]
                     if let Some(p) = pid {
+                        // First try to find a child process (for sandbox-exec)
+                        if let Ok(children) =
+                            std::fs::read_to_string(format!("/proc/{}/task/{}/children", p, p))
+                        {
+                            // Get the first child PID
+                            if let Some(child_pid) = children.split_whitespace().next() {
+                                if let Ok(link) =
+                                    std::fs::read_link(format!("/proc/{}/cwd", child_pid))
+                                {
+                                    return Some(link.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                        // Fall back to the process's own CWD
                         if let Ok(link) = std::fs::read_link(format!("/proc/{}/cwd", p)) {
                             return Some(link.to_string_lossy().to_string());
                         }
