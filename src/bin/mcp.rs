@@ -3,7 +3,7 @@
 //! This MCP server exposes a `fire_command` tool that sends commands
 //! to document paths via MQTT, bridging LLM tool-use with commonplace.
 
-use commonplace_doc::mqtt::{CommandMessage, MqttClient, MqttConfig, Topic};
+use commonplace_doc::mqtt::{CommandMessage, MqttConfig, Topic};
 use rmcp::{
     handler::server::ServerHandler,
     model::{
@@ -14,10 +14,9 @@ use rmcp::{
     transport::io::stdio,
     ServiceExt,
 };
-use rumqttc::QoS;
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Parameters for the fire_command tool
@@ -60,30 +59,79 @@ impl CommonplaceMcp {
             ..Default::default()
         };
 
-        let client = MqttClient::connect(config)
-            .await
-            .map_err(|e| format!("MQTT connection failed: {}", e))?;
+        // Parse broker URL
+        let broker_url = &config.broker_url;
+        let stripped = broker_url
+            .strip_prefix("mqtt://")
+            .or_else(|| broker_url.strip_prefix("tcp://"))
+            .unwrap_or(broker_url);
+        let parts: Vec<&str> = stripped.split(':').collect();
+        let host = parts.first().unwrap_or(&"localhost").to_string();
+        let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1883);
 
-        let client = Arc::new(client);
-        let client_clone = client.clone();
+        let mut options = MqttOptions::new(&config.client_id, host, port);
+        options.set_keep_alive(Duration::from_secs(config.keep_alive_secs));
+        options.set_clean_session(config.clean_session);
 
-        let loop_handle = tokio::spawn(async move {
-            let _ =
-                tokio::time::timeout(Duration::from_secs(2), client_clone.run_event_loop()).await;
-        });
+        let (client, mut event_loop) = AsyncClient::new(options, 256);
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for ConnAck with timeout
+        let connect_timeout = Duration::from_secs(5);
+        let connect_deadline = tokio::time::Instant::now() + connect_timeout;
+        let mut connected = false;
 
+        while tokio::time::Instant::now() < connect_deadline {
+            match tokio::time::timeout(Duration::from_millis(100), event_loop.poll()).await {
+                Ok(Ok(Event::Incoming(Packet::ConnAck(ack)))) => {
+                    if ack.code == rumqttc::ConnectReturnCode::Success {
+                        connected = true;
+                        break;
+                    } else {
+                        return Err(format!("MQTT connection rejected: {:?}", ack.code));
+                    }
+                }
+                Ok(Ok(_)) => continue, // Other events, keep polling
+                Ok(Err(e)) => return Err(format!("MQTT connection error: {}", e)),
+                Err(_) => continue, // Timeout, keep trying
+            }
+        }
+
+        if !connected {
+            return Err("MQTT connection timeout".to_string());
+        }
+
+        // Publish the message
         let payload_bytes = serde_json::to_vec(&message)
             .map_err(|e| format!("JSON serialization failed: {}", e))?;
 
         client
-            .publish(&topic_str, &payload_bytes, QoS::AtLeastOnce)
+            .publish(&topic_str, QoS::AtLeastOnce, false, payload_bytes)
             .await
             .map_err(|e| format!("MQTT publish failed: {}", e))?;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        loop_handle.abort();
+        // Wait for PubAck with timeout
+        let publish_timeout = Duration::from_secs(5);
+        let publish_deadline = tokio::time::Instant::now() + publish_timeout;
+        let mut acked = false;
+
+        while tokio::time::Instant::now() < publish_deadline {
+            match tokio::time::timeout(Duration::from_millis(100), event_loop.poll()).await {
+                Ok(Ok(Event::Incoming(Packet::PubAck(_)))) => {
+                    acked = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue, // Other events, keep polling
+                Ok(Err(e)) => return Err(format!("MQTT error while waiting for ack: {}", e)),
+                Err(_) => continue, // Timeout, keep trying
+            }
+        }
+
+        if !acked {
+            return Err("MQTT publish ack timeout".to_string());
+        }
+
+        // Disconnect gracefully
+        let _ = client.disconnect().await;
 
         Ok(format!("Sent {} to {}", params.verb, params.path))
     }
