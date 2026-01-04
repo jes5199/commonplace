@@ -212,6 +212,8 @@ gateways/telegram/script.txt/commands/#
 
 ## Permissions (Macaroons)
 
+See `docs/MACAROONS.md` for the broker-level authorization spec and caveat formats.
+
 Macaroons encode topic permissions with caveats:
 
 ```yaml
