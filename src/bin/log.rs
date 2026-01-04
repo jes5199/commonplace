@@ -249,6 +249,7 @@ fn format_single_commit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_output(
     args: &LogArgs,
     rel_path: &str,
