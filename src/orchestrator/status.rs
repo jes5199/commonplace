@@ -79,6 +79,45 @@ impl OrchestratorStatus {
             Err(e) => Err(e),
         }
     }
+
+    /// Merge processes from a specific source and write.
+    ///
+    /// This reads the existing status file, replaces processes that match
+    /// the given filter, adds the new processes, and writes the result.
+    ///
+    /// - `is_base_process`: if true, merge base processes (source_path is None)
+    /// - `is_base_process`: if false, merge discovered processes (source_path is Some)
+    pub fn merge_and_write(&self, is_base_process: bool) -> io::Result<()> {
+        // Read existing status, or start fresh if not found
+        let mut merged = match Self::read() {
+            Ok(existing) => existing,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::new(),
+            Err(e) => return Err(e),
+        };
+
+        // Update orchestrator info
+        merged.orchestrator_pid = self.orchestrator_pid;
+        merged.started_at = self.started_at;
+
+        // Remove processes from this source (base or discovered)
+        merged.processes.retain(|p| {
+            if is_base_process {
+                // Keep discovered processes (those with source_path)
+                p.source_path.is_some()
+            } else {
+                // Keep base processes (those without source_path)
+                p.source_path.is_none()
+            }
+        });
+
+        // Add our processes
+        merged.processes.extend(self.processes.clone());
+
+        // Sort by name for consistent output
+        merged.processes.sort_by(|a, b| a.name.cmp(&b.name));
+
+        merged.write()
+    }
 }
 
 impl Default for OrchestratorStatus {

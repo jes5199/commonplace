@@ -159,10 +159,8 @@ impl DiscoveredProcessManager {
             });
         }
 
-        // Sort by name for consistent output
-        status.processes.sort_by(|a, b| a.name.cmp(&b.name));
-
-        if let Err(e) = status.write() {
+        // Merge with existing status (preserving base processes) and write
+        if let Err(e) = status.merge_and_write(false) {
             tracing::warn!("[discovery] Failed to write status file: {}", e);
         }
     }

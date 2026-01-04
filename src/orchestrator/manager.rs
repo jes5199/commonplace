@@ -111,10 +111,8 @@ impl ProcessManager {
             });
         }
 
-        // Sort by name for consistent output
-        status.processes.sort_by(|a, b| a.name.cmp(&b.name));
-
-        if let Err(e) = status.write() {
+        // Merge with existing status (preserving discovered processes) and write
+        if let Err(e) = status.merge_and_write(true) {
             tracing::warn!("[orchestrator] Failed to write status file: {}", e);
         }
     }
