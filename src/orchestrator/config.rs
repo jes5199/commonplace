@@ -8,6 +8,11 @@ pub struct OrchestratorConfig {
     pub mqtt_broker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_server: Option<String>,
+    /// Filesystem paths managed by this orchestrator.
+    /// Used for documentation and potential overlap detection.
+    /// Example: ["/workspace/team-a", "/shared/data"]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_paths: Vec<String>,
     pub processes: HashMap<String, ProcessConfig>,
 }
 
@@ -73,6 +78,29 @@ impl OrchestratorConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Compute a scoped lock file path based on the config file path.
+    /// This allows multiple orchestrators to run with different configs.
+    /// The lock file name is derived from a hash of the canonical config path.
+    pub fn lock_file_path(config_path: &std::path::Path) -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Use canonical path for consistency across relative/absolute paths
+        let canonical = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.to_path_buf());
+
+        // Hash the path to create a unique but short identifier
+        let mut hasher = DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Use first 12 hex chars of hash for readability
+        let hash_str = format!("{:012x}", hash & 0xffffffffffff);
+
+        std::env::temp_dir().join(format!("commonplace-orchestrator-{}.lock", hash_str))
     }
 
     /// Resolve the HTTP server URL with fallback chain:
@@ -263,5 +291,54 @@ mod tests {
         let json = r#"{ "processes": {} }"#;
         let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.resolve_server_url(), "http://localhost:3000");
+    }
+
+    #[test]
+    fn test_lock_file_path_unique_per_config() {
+        use std::path::Path;
+
+        let path_a = Path::new("/tmp/config-a.json");
+        let path_b = Path::new("/tmp/config-b.json");
+
+        let lock_a = OrchestratorConfig::lock_file_path(path_a);
+        let lock_b = OrchestratorConfig::lock_file_path(path_b);
+
+        // Different configs should have different lock files
+        assert_ne!(lock_a, lock_b);
+
+        // Same config should have same lock file
+        let lock_a2 = OrchestratorConfig::lock_file_path(path_a);
+        assert_eq!(lock_a, lock_a2);
+    }
+
+    #[test]
+    fn test_lock_file_path_format() {
+        use std::path::Path;
+
+        let path = Path::new("/tmp/test-config.json");
+        let lock = OrchestratorConfig::lock_file_path(path);
+
+        // Should be in temp dir with expected prefix
+        let filename = lock.file_name().unwrap().to_str().unwrap();
+        assert!(filename.starts_with("commonplace-orchestrator-"));
+        assert!(filename.ends_with(".lock"));
+    }
+
+    #[test]
+    fn test_managed_paths_field() {
+        let json = r#"{
+            "managed_paths": ["/workspace/team-a", "/shared"],
+            "processes": {}
+        }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.managed_paths.len(), 2);
+        assert_eq!(config.managed_paths[0], "/workspace/team-a");
+    }
+
+    #[test]
+    fn test_managed_paths_optional() {
+        let json = r#"{ "processes": {} }"#;
+        let config: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert!(config.managed_paths.is_empty());
     }
 }

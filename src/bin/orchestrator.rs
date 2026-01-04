@@ -163,8 +163,9 @@ async fn main() {
     tracing::info!("[orchestrator] Starting commonplace-orchestrator");
     tracing::info!("[orchestrator] Config file: {:?}", args.config);
 
-    // Acquire global lock to prevent multiple orchestrators from running
-    let lock_path = std::env::temp_dir().join("commonplace-orchestrator.lock");
+    // Acquire scoped lock based on config file path
+    // This allows multiple orchestrators to run with different configs
+    let lock_path = OrchestratorConfig::lock_file_path(&args.config);
     let _lock_file = match File::create(&lock_path) {
         Ok(f) => f,
         Err(e) => {
@@ -179,15 +180,14 @@ async fn main() {
 
     match _lock_file.try_lock_exclusive() {
         Ok(()) => {
-            tracing::info!("[orchestrator] Acquired global lock");
+            tracing::info!("[orchestrator] Acquired lock for config {:?}", args.config);
         }
         Err(e) => {
             tracing::error!(
-                "[orchestrator] Another orchestrator is already running (lock file: {:?}): {}",
-                lock_path,
-                e
+                "[orchestrator] Another orchestrator is already running with config {:?}",
+                args.config
             );
-            tracing::error!("[orchestrator] Only one orchestrator instance can run at a time");
+            tracing::error!("[orchestrator] Lock file: {:?}, error: {}", lock_path, e);
             std::process::exit(1);
         }
     }
