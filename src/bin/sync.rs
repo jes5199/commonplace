@@ -11,9 +11,9 @@ use commonplace_doc::sync::{
     detect_from_path, directory_sse_task, directory_watcher_task, encode_node_id,
     ensure_fs_root_exists, file_watcher_task, fork_node, get_all_node_backed_dir_ids,
     handle_file_created, handle_file_deleted, handle_file_modified, handle_schema_change,
-    initial_sync, is_binary_content, scan_directory_with_contents, spawn_file_sync_tasks, sse_task,
-    subdir_sse_task, sync_schema, sync_single_file, upload_task, DirEvent, FileEvent,
-    FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
+    initial_sync, is_binary_content, push_schema_to_server, scan_directory_with_contents,
+    spawn_file_sync_tasks, sse_task, subdir_sse_task, sync_schema, sync_single_file, upload_task,
+    DirEvent, FileEvent, FileSyncState, ReplaceResponse, ScanOptions, SyncState, SCHEMA_FILENAME,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -183,12 +183,13 @@ async fn resolve_path_to_uuid(
             content: String,
         }
 
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Default)]
         struct Schema {
+            #[serde(default)]
             root: SchemaRoot,
         }
 
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Default)]
         struct SchemaRoot {
             entries: Option<std::collections::HashMap<String, SchemaEntry>>,
         }
@@ -199,7 +200,12 @@ async fn resolve_path_to_uuid(
         }
 
         let head: HeadResponse = resp.json().await?;
-        let schema: Schema = serde_json::from_str(&head.content)?;
+        // Handle empty schema "{}"
+        let schema: Schema = if head.content.trim() == "{}" {
+            Schema::default()
+        } else {
+            serde_json::from_str(&head.content)?
+        };
 
         // Look up the segment in entries
         let entries = schema.root.entries.ok_or_else(|| {
@@ -238,6 +244,167 @@ async fn resolve_path_to_uuid(
     Ok(current_id)
 }
 
+/// Resolve a path to UUID, or create the document if it doesn't exist.
+///
+/// This function first tries to resolve the path normally. If the final segment
+/// doesn't exist (but the parent path does), it creates a new entry in the parent's
+/// schema and waits for the reconciler to assign a UUID.
+///
+/// This is used for single-file sync when the server path doesn't exist yet.
+async fn resolve_or_create_path(
+    client: &Client,
+    server: &str,
+    path: &str,
+    local_file: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // First try to resolve normally
+    match resolve_path_to_uuid(client, server, path).await {
+        Ok(id) => return Ok(id),
+        Err(e) => {
+            let err_msg = e.to_string();
+            // Only proceed if it's a "not found" error for the final segment
+            if !err_msg.contains("not found") && !err_msg.contains("no entry") {
+                return Err(e);
+            }
+            info!("Path '{}' not found, will create it", path);
+        }
+    }
+
+    // Split path into parent and filename
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Err("Cannot create document at root path".into());
+    }
+
+    let filename = segments.last().unwrap();
+    let parent_segments = &segments[..segments.len() - 1];
+
+    // Get the parent document ID
+    let (parent_id, parent_path) = if parent_segments.is_empty() {
+        // Parent is fs-root
+        let fs_root_id = discover_fs_root(client, server).await?;
+        (fs_root_id, "fs-root".to_string())
+    } else {
+        // Resolve parent path (must exist)
+        let parent_path_str = parent_segments.join("/");
+        let parent_id = resolve_path_to_uuid(client, server, &parent_path_str).await?;
+        (parent_id, parent_path_str)
+    };
+
+    info!(
+        "Creating '{}' in parent '{}' ({})",
+        filename, parent_path, parent_id
+    );
+
+    // Fetch current parent schema
+    let head_url = format!("{}/docs/{}/head", server, encode_node_id(&parent_id));
+    let resp = client.get(&head_url).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch parent schema: HTTP {}", resp.status()).into());
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
+    struct Schema {
+        #[serde(default)]
+        version: u32,
+        #[serde(default)]
+        root: SchemaRoot,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, Clone)]
+    struct SchemaRoot {
+        #[serde(rename = "type")]
+        entry_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entries: Option<std::collections::HashMap<String, SchemaEntry>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+    }
+
+    impl Default for SchemaRoot {
+        fn default() -> Self {
+            Self {
+                entry_type: "dir".to_string(),
+                entries: None,
+                node_id: None,
+            }
+        }
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, Clone)]
+    struct SchemaEntry {
+        #[serde(rename = "type")]
+        entry_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HeadResp {
+        content: String,
+    }
+
+    let head: HeadResp = resp.json().await?;
+    // Parse schema, handling empty "{}" case
+    let mut schema: Schema = if head.content.trim() == "{}" {
+        Schema {
+            version: 1,
+            root: SchemaRoot::default(),
+        }
+    } else {
+        serde_json::from_str(&head.content)?
+    };
+
+    // Determine content type from local file
+    let content_info = detect_from_path(local_file);
+    let content_type = content_info.mime_type;
+
+    // Generate UUID locally (same as directory sync)
+    let node_id = uuid::Uuid::new_v4().to_string();
+
+    // Add entry for the new file with our generated UUID
+    let entries = schema
+        .root
+        .entries
+        .get_or_insert_with(std::collections::HashMap::new);
+    entries.insert(
+        filename.to_string(),
+        SchemaEntry {
+            entry_type: "doc".to_string(),
+            node_id: Some(node_id.clone()),
+            content_type: Some(content_type.to_string()),
+        },
+    );
+
+    // Push updated schema - this triggers the server-side reconciler
+    // which creates the document with our specified UUID
+    let schema_json = serde_json::to_string_pretty(&schema)?;
+    push_schema_to_server(client, server, &parent_id, &schema_json)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+
+    // Wait for the reconciler to create the document
+    info!("Waiting for server reconciler to create document...");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify document was created
+    let doc_url = format!("{}/docs/{}/info", server, encode_node_id(&node_id));
+    let resp = client.get(&doc_url).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Document '{}' was not created by reconciler. Check server logs.",
+            node_id
+        )
+        .into());
+    }
+
+    info!("Created document: {} -> {}", path, node_id);
+    Ok(node_id)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Initialize tracing
@@ -273,16 +440,31 @@ async fn main() -> ExitCode {
         // Direct UUID provided
         node.clone()
     } else if let Some(ref path) = args.path {
-        // Path provided - resolve to UUID
+        // Path provided - resolve to UUID (or create if using single-file mode)
         info!("Resolving path '{}' to UUID...", path);
-        match resolve_path_to_uuid(&client, &args.server, path).await {
-            Ok(id) => {
-                info!("Resolved '{}' -> {}", path, id);
-                id
+        if let Some(ref file) = args.file {
+            // Single-file mode with --path: create document if it doesn't exist
+            match resolve_or_create_path(&client, &args.server, path, file).await {
+                Ok(id) => {
+                    info!("Resolved '{}' -> {}", path, id);
+                    id
+                }
+                Err(e) => {
+                    error!("Failed to resolve/create path '{}': {}", path, e);
+                    return ExitCode::from(1);
+                }
             }
-            Err(e) => {
-                error!("Failed to resolve path '{}': {}", path, e);
-                return ExitCode::from(1);
+        } else {
+            // Directory mode: path must already exist
+            match resolve_path_to_uuid(&client, &args.server, path).await {
+                Ok(id) => {
+                    info!("Resolved '{}' -> {}", path, id);
+                    id
+                }
+                Err(e) => {
+                    error!("Failed to resolve path '{}': {}", path, e);
+                    return ExitCode::from(1);
+                }
             }
         }
     } else if let Some(ref source) = args.fork_from {
