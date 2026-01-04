@@ -1,0 +1,232 @@
+//! WebSocket connection handlers.
+
+use super::connection::{OutgoingMessage, WsConnection};
+use super::protocol::{
+    self, ProtocolMode, WsMessage, SUBPROTOCOL_COMMONPLACE, SUBPROTOCOL_Y_WEBSOCKET,
+};
+use super::room::RoomManager;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// WebSocket state shared across handlers.
+#[derive(Clone)]
+pub struct WsState {
+    pub room_manager: Arc<RoomManager>,
+}
+
+/// Handle WebSocket upgrade request.
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WsState>,
+    Path(doc_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    // Check if document exists
+    let room = state.room_manager.get_or_create_room(&doc_id).await;
+
+    // Negotiate subprotocol
+    let protocol = negotiate_protocol(&headers);
+
+    info!(
+        doc_id = %doc_id,
+        protocol = ?protocol,
+        "WebSocket upgrade request"
+    );
+
+    // Upgrade the connection
+    Ok(ws
+        .protocols([SUBPROTOCOL_Y_WEBSOCKET, SUBPROTOCOL_COMMONPLACE])
+        .on_upgrade(move |socket| handle_socket(socket, state, doc_id, protocol, room)))
+}
+
+/// Negotiate the WebSocket subprotocol from headers.
+fn negotiate_protocol(headers: &HeaderMap) -> ProtocolMode {
+    // Check Sec-WebSocket-Protocol header
+    if let Some(protocols) = headers.get("sec-websocket-protocol") {
+        if let Ok(s) = protocols.to_str() {
+            // Client sends comma-separated list of preferred protocols
+            for proto in s.split(',').map(|p| p.trim()) {
+                if proto == SUBPROTOCOL_COMMONPLACE {
+                    return ProtocolMode::Commonplace;
+                }
+                if proto == SUBPROTOCOL_Y_WEBSOCKET {
+                    return ProtocolMode::YWebSocket;
+                }
+            }
+        }
+    }
+
+    // Default to y-websocket for maximum compatibility
+    ProtocolMode::YWebSocket
+}
+
+/// Handle an established WebSocket connection.
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: WsState,
+    doc_id: String,
+    protocol: ProtocolMode,
+    room: Arc<super::room::Room>,
+) {
+    // Create channel for outgoing messages
+    let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(256);
+
+    // Create connection
+    let conn = Arc::new(RwLock::new(WsConnection::new(doc_id.clone(), protocol, tx)));
+
+    let conn_id = conn.read().await.id.clone();
+    info!(conn_id = %conn_id, doc_id = %doc_id, "WebSocket connected");
+
+    // Add to room
+    room.add_connection(conn.clone()).await;
+
+    // Initial sync: send our state vector and full state
+    if let Err(e) = send_initial_sync(&conn, &room, &mut socket).await {
+        warn!(conn_id = %conn_id, "Failed initial sync: {}", e);
+    }
+
+    // Main loop: handle incoming and outgoing messages
+    loop {
+        tokio::select! {
+            // Handle outgoing messages from channel
+            Some(msg) = rx.recv() => {
+                let ws_msg = match msg {
+                    OutgoingMessage::Binary(data) => Message::Binary(data),
+                    OutgoingMessage::Close => {
+                        let _ = socket.close().await;
+                        break;
+                    }
+                };
+                if let Err(e) = socket.send(ws_msg).await {
+                    debug!("Failed to send WebSocket message: {}", e);
+                    break;
+                }
+            }
+
+            // Handle incoming messages
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        conn.write().await.touch();
+                        if let Err(e) = handle_binary_message(&conn_id, &data, &room).await {
+                            warn!(conn_id = %conn_id, "Error handling message: {}", e);
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        // Pong is handled automatically by axum
+                        debug!(conn_id = %conn_id, "Received ping");
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        conn.write().await.touch();
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        info!(conn_id = %conn_id, "Client initiated close");
+                        break;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        // y-websocket uses binary, but some clients might send text
+                        conn.write().await.touch();
+                        if let Err(e) = handle_binary_message(&conn_id, text.as_bytes(), &room).await {
+                            warn!(conn_id = %conn_id, "Error handling text message: {}", e);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!(conn_id = %conn_id, "WebSocket error: {}", e);
+                        break;
+                    }
+                    None => {
+                        info!(conn_id = %conn_id, "WebSocket stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    info!(conn_id = %conn_id, doc_id = %doc_id, "WebSocket disconnected");
+    room.remove_connection(&conn_id).await;
+
+    // Cleanup empty rooms periodically (could be moved to a background task)
+    state.room_manager.cleanup_empty_rooms().await;
+}
+
+/// Send initial sync to a new connection.
+async fn send_initial_sync(
+    _conn: &Arc<RwLock<WsConnection>>,
+    room: &Arc<super::room::Room>,
+    socket: &mut WebSocket,
+) -> Result<(), super::room::RoomError> {
+    // Get server's state vector
+    let sv = room.get_state_vector().await?;
+
+    // Send SyncStep1 (our state vector) - asking client what we're missing
+    let sync_step1 = protocol::encode_sync_step1(&sv);
+    let _ = socket.send(Message::Binary(sync_step1)).await;
+
+    // Send SyncStep2 with full state (so client gets everything)
+    // Use empty state vector to get full document
+    let full_state = room.handle_sync_step1(&[]).await?;
+    let _ = socket.send(Message::Binary(full_state)).await;
+
+    Ok(())
+}
+
+/// Handle a binary WebSocket message.
+async fn handle_binary_message(
+    conn_id: &str,
+    data: &[u8],
+    room: &Arc<super::room::Room>,
+) -> Result<(), String> {
+    let msg = protocol::decode_message(data).map_err(|e| e.to_string())?;
+
+    match msg {
+        WsMessage::SyncStep1 { state_vector } => {
+            // Client is asking what updates we have that they don't
+            let response = room
+                .handle_sync_step1(&state_vector)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // Send response to the specific connection
+            // Note: We need access to the connection here
+            // For now, broadcast to all (the sender will receive it too, which is fine)
+            room.broadcast_all(response).await;
+        }
+        WsMessage::SyncStep2 { update } => {
+            // Client is sending us updates we're missing
+            room.handle_update(conn_id, &update)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        WsMessage::Update { update } => {
+            // Incremental update from client
+            room.handle_update(conn_id, &update)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        WsMessage::Awareness { data: _ } => {
+            // Awareness is deferred - just ignore for now
+            debug!("Ignoring awareness message (not implemented)");
+        }
+        WsMessage::CommitMeta { .. } => {
+            // Commonplace extension - TODO in Phase 2
+            debug!("CommitMeta message (commonplace mode) - not yet implemented");
+        }
+        WsMessage::BlueEvent { .. } => {
+            // Commonplace extension - TODO in Phase 2
+            debug!("BlueEvent message (commonplace mode) - not yet implemented");
+        }
+        WsMessage::RedEvent { .. } => {
+            // Commonplace extension - TODO in Phase 2
+            debug!("RedEvent message (commonplace mode) - not yet implemented");
+        }
+    }
+
+    Ok(())
+}

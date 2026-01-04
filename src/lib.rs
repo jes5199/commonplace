@@ -17,6 +17,7 @@ pub mod sse;
 pub mod store;
 pub mod sync;
 pub mod workspace;
+pub mod ws;
 
 use axum::{routing::get, Router};
 use content_type::ContentType;
@@ -178,6 +179,12 @@ pub async fn create_router_with_config(config: RouterConfig) -> Router {
             service,
         ))
         .merge(sse::router(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            config.fs_root.clone(),
+        ))
+        .merge(ws::router(
             doc_store,
             commit_store,
             commit_broadcaster,
@@ -216,6 +223,12 @@ pub fn create_router_with_store(store: Option<CommitStore>) -> Router {
             service,
         ))
         .merge(sse::router(
+            doc_store.clone(),
+            commit_store.clone(),
+            commit_broadcaster.clone(),
+            None,
+        ))
+        .merge(ws::router(
             doc_store,
             commit_store,
             commit_broadcaster,
