@@ -1,9 +1,10 @@
 {
   "mqtt_broker": "localhost:1883",
+  "managed_paths": ["/"],
   "processes": {
     "server": {
       "command": "/home/jes/commonplace/target/release/commonplace-server",
-      "args": ["--database", "/tmp/sandbox-orchestrator.redb", "--fs-root", "sandbox-workspace"],
+      "args": ["--database", "/tmp/commonplace.redb", "--fs-root", "workspace"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
@@ -12,7 +13,7 @@
     },
     "sync": {
       "command": "/home/jes/commonplace/target/release/commonplace-sync",
-      "args": ["--server", "http://localhost:3000", "--node", "sandbox-workspace", "--directory", "/home/jes/sandbox-workspace", "--initial-sync", "local"],
+      "args": ["--server", "http://localhost:3000", "--node", "workspace", "--directory", "./workspace", "--initial-sync", "local"],
       "restart": {
         "policy": "always",
         "backoff_ms": 500,
