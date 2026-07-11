@@ -13,6 +13,23 @@ defmodule CommonplaceWebWeb.Plugs.FederationAuth do
 
   No configured peers ⇒ federation is OFF and every request 403s — the
   secure default for workspaces that never opted in.
+
+  ## Cross-repo Slice-0 (2026-07-11 spec, §1 Seam C) — identity-bound peers
+
+  A peer entry MAY instead be a map naming the requester's identity, so
+  the `:read`-cert gate (`FederationController`) can use the
+  SERVER-RESOLVED requester key for the audience-binding check — NEVER a
+  client-claimed value:
+
+      config :commonplace_web, :federation_peers,
+        %{"s3cret" => %{name: "peer-b", identity_uuid: "repo-b-root", pubkey: <<...>>}}
+
+  A bare string peer (legacy shape) is normalized to
+  `%{name: peer, identity_uuid: peer, pubkey: nil}` — it authenticates
+  (transport hygiene) but never satisfies a `:read` cert's audience
+  binding (no pubkey to match), so it behaves exactly as before under a
+  permissive (`accept_unsigned: true`) trust config, and is correctly
+  refused a doc gated under a strict one.
   """
   import Plug.Conn
 
@@ -23,7 +40,7 @@ defmodule CommonplaceWebWeb.Plugs.FederationAuth do
 
     with [<<"Bearer ", token::binary>>] <- get_req_header(conn, "authorization"),
          {:ok, peer} <- lookup(peers, token) do
-      assign(conn, :federation_peer, peer)
+      assign(conn, :federation_peer, normalize(peer))
     else
       _ ->
         conn
@@ -37,5 +54,15 @@ defmodule CommonplaceWebWeb.Plugs.FederationAuth do
     Enum.find_value(peers, :error, fn {candidate, peer} ->
       if Plug.Crypto.secure_compare(candidate, token), do: {:ok, peer}
     end)
+  end
+
+  defp normalize(peer) when is_binary(peer), do: %{name: peer, identity_uuid: peer, pubkey: nil}
+
+  defp normalize(%{name: name} = peer) do
+    %{
+      name: name,
+      identity_uuid: Map.get(peer, :identity_uuid, name),
+      pubkey: Map.get(peer, :pubkey)
+    }
   end
 end

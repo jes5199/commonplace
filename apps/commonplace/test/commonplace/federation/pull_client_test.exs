@@ -67,21 +67,26 @@ defmodule Commonplace.Federation.PullClientTest do
       File.rm_rf!(dir)
     end)
 
-    root_ctx = %SigningContext{identity_uuid: root_uuid, private_key: root_priv, public_key: root_pub}
+    root_ctx = %SigningContext{
+      identity_uuid: root_uuid,
+      private_key: root_priv,
+      public_key: root_pub
+    }
+
     %{serving: serving, pulling: pulling, root: %{uuid: root_uuid, ctx: root_ctx, pub: root_pub}}
   end
 
   # Stub transport: implements the two pull endpoints against `serving`.
   defp stub_transport(serving) do
     fn
-      :cids, _peer, doc_uuid ->
+      :cids, _peer, %{uuid: doc_uuid} ->
         cids =
           CommitStore.commit_ids_for_doc(serving, doc_uuid)
           |> Enum.map(&Base.encode64/1)
 
         {:ok, %{"cids" => cids}}
 
-      :commits, _peer, {doc_uuid, b64_cids} ->
+      :commits, _peer, {%{uuid: doc_uuid}, b64_cids} ->
         envelopes =
           for b64 <- b64_cids,
               {:ok, id} = Base.decode64(b64),
@@ -108,11 +113,16 @@ defmodule Commonplace.Federation.PullClientTest do
     :ok = CommitStore.store_capability(store, cert)
 
     commit =
-      Commit.new(doc, Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()), nil, %{
-        kind: :regular,
-        snapshot_parent: :crypto.hash(:sha256, "epoch-" <> doc),
-        capability_proof: cert.id
-      })
+      Commit.new(
+        doc,
+        Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()),
+        nil,
+        %{
+          kind: :regular,
+          snapshot_parent: :crypto.hash(:sha256, "epoch-" <> doc),
+          capability_proof: cert.id
+        }
+      )
       |> Signing.sign_commit(agent_priv, Signing.signer_id(agent_uuid, agent_pub))
 
     :ok = CommitStore.import_commit(store, commit, validator: fn _ -> :ok end)
@@ -154,10 +164,15 @@ defmodule Commonplace.Federation.PullClientTest do
     doc = UUID.uuid4()
 
     unsigned =
-      Commit.new(doc, Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()), nil, %{
-        kind: :regular,
-        snapshot_parent: :crypto.hash(:sha256, "epoch-u")
-      })
+      Commit.new(
+        doc,
+        Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()),
+        nil,
+        %{
+          kind: :regular,
+          snapshot_parent: :crypto.hash(:sha256, "epoch-u")
+        }
+      )
 
     # Trust config is global to the node — open a permissive window to
     # seed the serving side, then restore strict for the pull.

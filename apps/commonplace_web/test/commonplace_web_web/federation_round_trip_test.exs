@@ -55,6 +55,7 @@ defmodule CommonplaceWebWeb.FederationRoundTripTest do
     _ = Supervisor.delete_child(sup, Commonplace.Store.TrustSideStore)
     _ = Supervisor.terminate_child(sup, CommitStore)
     _ = Supervisor.delete_child(sup, CommitStore)
+
     {:ok, _} =
       Supervisor.start_child(
         sup,
@@ -67,7 +68,8 @@ defmodule CommonplaceWebWeb.FederationRoundTripTest do
     {:ok, _} =
       Supervisor.start_child(sup, {Commonplace.Store.TrustSideStore, commit_store: CommitStore})
 
-    {:ok, _} = Supervisor.start_child(sup, {Commonplace.Store.PendingImports, commit_store: CommitStore})
+    {:ok, _} =
+      Supervisor.start_child(sup, {Commonplace.Store.PendingImports, commit_store: CommitStore})
 
     # Pulling side = its own trio, its own root. PullClient calls
     # store_capability/2 on this side when inlining a fetched envelope's
@@ -106,7 +108,12 @@ defmodule CommonplaceWebWeb.FederationRoundTripTest do
     # agent's cert on the serving side.
     {root_pub, root_priv} = Signing.generate_keypair()
     root_uuid = "root-" <> UUID.uuid4()
-    root_ctx = %SigningContext{identity_uuid: root_uuid, private_key: root_priv, public_key: root_pub}
+
+    root_ctx = %SigningContext{
+      identity_uuid: root_uuid,
+      private_key: root_priv,
+      public_key: root_pub
+    }
 
     Application.put_env(:commonplace, :trust, %{
       accept_unsigned: false,
@@ -129,18 +136,48 @@ defmodule CommonplaceWebWeb.FederationRoundTripTest do
     :ok = CommitStore.store_capability(CommitStore, cert)
 
     commit =
-      Commit.new(doc, Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()), nil, %{
-        kind: :regular,
-        snapshot_parent: :crypto.hash(:sha256, "fed-rt-epoch"),
-        capability_proof: cert.id
-      })
+      Commit.new(
+        doc,
+        Yelixer.Encoding.encode_update(Commonplace.Tree.Schema.new_schema()),
+        nil,
+        %{
+          kind: :regular,
+          snapshot_parent: :crypto.hash(:sha256, "fed-rt-epoch"),
+          capability_proof: cert.id
+        }
+      )
       |> Signing.sign_commit(agent_priv, Signing.signer_id(agent_uuid, agent_pub))
 
     :ok = CommitStore.import_commit(CommitStore, commit, validator: fn _ -> :ok end)
 
+    # Cross-repo Slice-0 (2026-07-11 spec, §1 Seam C): the serving side
+    # (A) now gates `cids`/`commits` by a `:read` cert too — under this
+    # STRICT trust config, A's bearer-token peer map must additionally
+    # identify the puller's (B's) key, and A's root must grant B a
+    # `:read` cert over `doc`, or A's serve refuses (existence-hiding),
+    # same as the coarse-token-only model would 404. This is the NEW
+    # security seam this spec builds — a bare-token peer with no cert
+    # would legitimately be turned away here.
+    {puller_pub, _puller_priv} = Signing.generate_keypair()
+    puller_uuid = "puller-" <> UUID.uuid4()
+
+    {:ok, read_cert} =
+      Commonplace.Trust.Read.grant(root_ctx, doc, {puller_uuid, puller_pub}, store: CommitStore)
+
+    Application.put_env(:commonplace_web, :federation_peers, %{
+      @token => %{name: "puller", identity_uuid: puller_uuid, pubkey: puller_pub}
+    })
+
     # The pulling workspace federates over the real socket — default
-    # HTTP transport, bearer-token auth, strict import gate.
-    peer = %{name: "ws-a", base_url: "http://127.0.0.1:#{port}", token: @token, docs: [doc]}
+    # HTTP transport, bearer-token auth, strict import gate — presenting
+    # its granted `:read` cert cid on every pull request.
+    peer = %{
+      name: "ws-a",
+      base_url: "http://127.0.0.1:#{port}",
+      token: @token,
+      docs: [%{uuid: doc, read_cert_cid: read_cert.id}]
+    }
+
     report = PullClient.pull_once([peer], store: pulling)
 
     assert report.imported >= 1
@@ -153,5 +190,69 @@ defmodule CommonplaceWebWeb.FederationRoundTripTest do
     bad_peer = %{peer | token: "wrong"}
     bad_report = PullClient.pull_once([bad_peer], store: pulling)
     assert [{_, _, {:http_status, 403}} | _] = bad_report.errors
+
+    # --- read-only safety: second pull is idempotent (no double-import,
+    # no local mutation attempt) --------------------------------------
+    idempotent_report = PullClient.pull_once([peer], store: pulling)
+    assert idempotent_report.imported == 0
+    assert idempotent_report.rejected == 0
+
+    # --- live-flow: A edits doc (a new, CHAINED commit) → B re-pulls
+    # and its replica's known-commit set (its ":latest") advances -----
+    before_ids = CommitStore.commit_ids_for_doc(pulling, doc) |> MapSet.new()
+
+    update2 =
+      Yelixer.Doc.new()
+      |> Commonplace.Tree.Schema.add_file("f", UUID.uuid4())
+      |> Yelixer.Encoding.encode_update()
+
+    commit2 =
+      Commit.new(doc, update2, commit.id, %{
+        kind: :regular,
+        snapshot_parent: :crypto.hash(:sha256, "fed-rt-epoch"),
+        capability_proof: cert.id
+      })
+      |> Signing.sign_commit(agent_priv, Signing.signer_id(agent_uuid, agent_pub))
+
+    :ok = CommitStore.import_commit(CommitStore, commit2, validator: fn _ -> :ok end)
+
+    # `import_commit` is the catch-up primitive (stores without moving
+    # `:latest` — that decision belongs to the higher authoring/merge
+    # layer); simulate A's local authoring path advancing its own head
+    # to this new commit, exactly as `create_chained_commit` would.
+    :ok = CommitStore.set_latest(CommitStore, doc, commit2.id)
+
+    live_report = PullClient.pull_once([peer], store: pulling)
+
+    assert live_report.imported >= 1
+    assert live_report.errors == []
+    assert {:ok, _} = CommitStore.get_commit(pulling, commit2.id)
+
+    # NOTE (design fork, surfaced not silently worked around):
+    # `commit_ids_for_doc`/`:latest` do NOT advance here — `MergeAdopter`
+    # (wired into `NodeSync.import_with_translation`) only auto-adopts a
+    # freshly-landed `:merge` commit as the new local head (CX-m3x: "a
+    # peer that only receives merges never advances `:latest`... this
+    # module fills the gap"); a plain `:regular` chained commit pulled
+    # via catch-up is stored but intentionally does NOT move `:latest`,
+    # to protect a REGULAR node's own local edits from being clobbered by
+    # background sync. For a Slice-0 replica that NEVER authors locally,
+    # that guard has nothing to protect and arguably should fast-forward
+    # on a strict linear descent — but widening `MergeAdopter` (or adding
+    # a replica-specific adoption rule) is a real trust/sync-semantics
+    # decision beyond this seam's small surface. Flagging for jes/boss
+    # rather than quietly patching it. The commit DOES land (`imported`,
+    # `get_commit`), proving the live pull itself works end-to-end; only
+    # the rendered `:latest` pointer is the open gap.
+    before_ids = MapSet.put(before_ids, commit.id)
+    after_ids = CommitStore.commit_ids_for_doc(pulling, doc) |> MapSet.new()
+    assert after_ids == before_ids
+
+    # B never mints/serves commits FOR A — B has no federation-serve
+    # peer of its own configured and PullClient exposes no write path
+    # upstream; the replica advanced purely by importing A's commits
+    # into ITS OWN store, never by writing back to A's.
+    assert CommitStore.commit_ids_for_doc(CommitStore, doc) |> MapSet.new() ==
+             MapSet.new([commit.id, commit2.id])
   end
 end

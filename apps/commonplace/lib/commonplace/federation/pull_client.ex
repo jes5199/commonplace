@@ -31,6 +31,20 @@ defmodule Commonplace.Federation.PullClient do
   No config ⇒ the client is not started (federation off by default).
   The `transport` option is injectable for tests; the default speaks
   HTTP via `Req` against the `commonplace_web` federation endpoints.
+
+  ## Cross-repo Slice-0 (2026-07-11 spec, §1 Seam C / §3.4) — presenting B's `:read` cert
+
+  A `docs` entry may be either a bare uuid string (legacy — no cert
+  presented) or `%{uuid:, read_cert_cid:}`, where `read_cert_cid` is the
+  base64-encoded CID of the `:read` capability A granted B for that doc
+  (minted via `Trust.Read.grant/4` on A, handed to B out-of-band — the
+  same way any delegated cert reaches its holder). Every pull request
+  (`cids` + `commits`) presents that cert cid to A's `:read`-cert gate
+  (`FederationController`), which resolves WHO is asking from the
+  authenticated bearer token (never from this param) and checks the
+  cert's audience against that identity — `commits/2`'s existing
+  cert-inlining behavior on the CERT-GRANTING side of a delegation chain
+  is untouched; this is the READ side.
   """
   use GenServer
   require Logger
@@ -96,15 +110,28 @@ defmodule Commonplace.Federation.PullClient do
 
   # --- one peer × doc pull ---
 
-  defp pull_doc(peer, doc, store, transport, acc) do
-    with {:ok, %{"cids" => remote_b64}} <- transport.(:cids, peer, doc),
-         missing = diff_missing(store, doc, remote_b64),
-         {:ok, %{"envelopes" => envelopes}} <- fetch_missing(transport, peer, doc, missing) do
+  # Normalize a `docs` entry to `{uuid, read_cert_cids}` — a bare string
+  # (legacy) presents no cert; `%{uuid:, read_cert_cid:}` decodes its
+  # single cid into the list `read_authorized?`-style callers expect.
+  defp normalize_doc(uuid) when is_binary(uuid), do: {uuid, []}
+
+  defp normalize_doc(%{uuid: uuid} = entry) do
+    {uuid, entry |> Map.get(:read_cert_cid) |> List.wrap()}
+  end
+
+  defp pull_doc(peer, doc_entry, store, transport, acc) do
+    {uuid, cert_cids} = normalize_doc(doc_entry)
+
+    with {:ok, %{"cids" => remote_b64}} <-
+           transport.(:cids, peer, %{uuid: uuid, cert_cids: cert_cids}),
+         missing = diff_missing(store, uuid, remote_b64),
+         {:ok, %{"envelopes" => envelopes}} <-
+           fetch_missing(transport, peer, %{uuid: uuid, cert_cids: cert_cids}, missing) do
       Enum.reduce(envelopes, acc, fn encoded, acc ->
-        import_envelope(store, encoded, acc, peer, doc)
+        import_envelope(store, encoded, acc, peer, uuid)
       end)
     else
-      {:error, reason} -> %{acc | errors: acc.errors ++ [{peer.name, doc, reason}]}
+      {:error, reason} -> %{acc | errors: acc.errors ++ [{peer.name, uuid, reason}]}
     end
   end
 
@@ -118,10 +145,13 @@ defmodule Commonplace.Federation.PullClient do
   end
 
   defp fetch_missing(_transport, _peer, _doc, []), do: {:ok, %{"envelopes" => []}}
-  defp fetch_missing(transport, peer, doc, missing), do: transport.(:commits, peer, {doc, missing})
+
+  defp fetch_missing(transport, peer, doc, missing),
+    do: transport.(:commits, peer, {doc, missing})
 
   defp import_envelope(store, encoded, acc, peer, doc) do
-    with {:ok, %{commit: commit, certs: certs, revocations: revocations}} <- Envelope.decode(encoded),
+    with {:ok, %{commit: commit, certs: certs, revocations: revocations}} <-
+           Envelope.decode(encoded),
          :ok <- Envelope.verify_certs(certs),
          :ok <- Envelope.verify_revocations(revocations) do
       Enum.each(certs, &CommitStoreClient.store_capability(store, &1))
@@ -149,19 +179,28 @@ defmodule Commonplace.Federation.PullClient do
 
   # --- default HTTP transport (the commonplace_web federation routes) ---
 
-  defp http_transport(:cids, peer, doc) do
-    request(:get, peer, "/federation/docs/#{doc}/cids", nil)
+  defp http_transport(:cids, peer, %{uuid: uuid, cert_cids: cert_cids}) do
+    request(:get, peer, "/federation/docs/#{uuid}/cids", nil, cert_cids_query(cert_cids))
   end
 
-  defp http_transport(:commits, peer, {doc, cids}) do
-    request(:post, peer, "/federation/docs/#{doc}/commits", %{cids: cids})
+  defp http_transport(:commits, peer, {%{uuid: uuid, cert_cids: cert_cids}, cids}) do
+    request(:post, peer, "/federation/docs/#{uuid}/commits", %{
+      cids: cids,
+      cert_cids: encode_cert_cids(cert_cids)
+    })
   end
 
-  defp request(method, peer, path, body) do
+  defp cert_cids_query([]), do: []
+  defp cert_cids_query(cert_cids), do: [cert_cids: Enum.join(encode_cert_cids(cert_cids), ",")]
+
+  defp encode_cert_cids(cert_cids), do: Enum.map(cert_cids, &Base.encode64/1)
+
+  defp request(method, peer, path, body, query \\ []) do
     opts = [
       method: method,
       url: peer.base_url <> path,
       headers: [{"authorization", "Bearer " <> peer.token}],
+      params: query,
       retry: false
     ]
 

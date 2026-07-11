@@ -50,7 +50,8 @@ defmodule CommonplaceWebWeb.FederationControllerTest do
     {:ok, _} =
       Supervisor.start_child(sup, {Commonplace.Store.TrustSideStore, commit_store: CommitStore})
 
-    {:ok, _} = Supervisor.start_child(sup, {Commonplace.Store.PendingImports, commit_store: CommitStore})
+    {:ok, _} =
+      Supervisor.start_child(sup, {Commonplace.Store.PendingImports, commit_store: CommitStore})
 
     Application.put_env(:commonplace_web, :federation_peers, %{@token => @peer})
 
@@ -71,9 +72,14 @@ defmodule CommonplaceWebWeb.FederationControllerTest do
 
   defp ident(id) do
     {pub, priv} = Signing.generate_keypair()
-    %{uuid: id, pub: pub, priv: priv,
+
+    %{
+      uuid: id,
+      pub: pub,
+      priv: priv,
       ctx: %SigningContext{identity_uuid: id, private_key: priv, public_key: pub},
-      signer: Signing.signer_id(id, pub)}
+      signer: Signing.signer_id(id, pub)
+    }
   end
 
   # A root pinned strict, delegating :write over `docs` to an agent.
@@ -161,6 +167,163 @@ defmodule CommonplaceWebWeb.FederationControllerTest do
       assert {:ok, %{commit: commit}} = Envelope.decode(envelope)
       assert commit.id == c1.id
       assert resp["missing"] == [Base.encode64(:crypto.hash(:sha256, "missing"))]
+    end
+  end
+
+  describe "cross-repo Slice-0 :read-cert gate (2026-07-11 spec, §1 Seam C — THE SECURITY SEAM)" do
+    # A strict trust config with a pinned root — the requesting peer is
+    # NOT itself pinned, so it must present a valid, audience-bound
+    # `:read` cert or be refused.
+    defp strict_root do
+      root = ident("root-" <> UUID.uuid4())
+
+      Application.put_env(:commonplace, :trust, %{
+        accept_unsigned: false,
+        trusted_identities: %{root.uuid => Signing.encode_key(root.pub)}
+      })
+
+      root
+    end
+
+    defp identity_bound_peer(pub, opts \\ []) do
+      %{
+        name: Keyword.get(opts, :name, @peer),
+        identity_uuid: Keyword.get(opts, :identity_uuid, @peer),
+        pubkey: pub
+      }
+    end
+
+    test "read-scope: A grants B a :read cert for doc X only — X is served, unscoped Y is refused",
+         %{conn: conn} do
+      root = strict_root()
+      reader = ident("reader-" <> UUID.uuid4())
+
+      Application.put_env(:commonplace_web, :federation_peers, %{
+        @token => identity_bound_peer(reader.pub)
+      })
+
+      doc_x = UUID.uuid4()
+      doc_y = UUID.uuid4()
+      _ = CommitStore.create_commit(CommitStore, doc_x, <<1>>, nil)
+      _ = CommitStore.create_commit(CommitStore, doc_y, <<2>>, nil)
+
+      {:ok, cert} =
+        Commonplace.Trust.Read.grant(root.ctx, doc_x, {reader.uuid, reader.pub},
+          store: CommitStore
+        )
+
+      cert_b64 = Base.encode64(cert.id)
+
+      # X: served (granted).
+      resp_x =
+        conn
+        |> authed()
+        |> get(~p"/federation/docs/#{doc_x}/cids?cert_cids=#{cert_b64}")
+        |> json_response(200)
+
+      assert resp_x["cids"] != []
+
+      # Y: NOT covered by the cert — existence-hiding, identical shape to
+      # a doc that was never configured/known at all (same 200, empty cids).
+      resp_y =
+        conn
+        |> authed()
+        |> get(~p"/federation/docs/#{doc_y}/cids?cert_cids=#{cert_b64}")
+        |> json_response(200)
+
+      assert resp_y == %{"cids" => []}
+
+      # A genuinely-nonexistent doc gets the SAME shape — proving the
+      # denial is indistinguishable from "doesn't exist".
+      resp_nonexistent =
+        conn
+        |> authed()
+        |> get(~p"/federation/docs/#{UUID.uuid4()}/cids?cert_cids=#{cert_b64}")
+        |> json_response(200)
+
+      assert resp_nonexistent == resp_y
+    end
+
+    test "existence-hiding: no cert presented at all on a gated doc → same empty shape, both endpoints",
+         %{
+           conn: conn
+         } do
+      _root = strict_root()
+      reader = ident("reader-" <> UUID.uuid4())
+
+      Application.put_env(:commonplace_web, :federation_peers, %{
+        @token => identity_bound_peer(reader.pub)
+      })
+
+      doc = UUID.uuid4()
+      c1 = CommitStore.create_commit(CommitStore, doc, <<1>>, nil)
+
+      resp_cids = conn |> authed() |> get(~p"/federation/docs/#{doc}/cids") |> json_response(200)
+      assert resp_cids == %{"cids" => []}
+
+      resp_commits =
+        conn
+        |> authed()
+        |> post(~p"/federation/docs/#{doc}/commits", %{"cids" => [Base.encode64(c1.id)]})
+        |> json_response(200)
+
+      assert resp_commits == %{"envelopes" => [], "missing" => [Base.encode64(c1.id)]}
+    end
+
+    test "audience anti-theft: a :read cert addressed to a DIFFERENT identity is refused", %{
+      conn: conn
+    } do
+      root = strict_root()
+      legit_reader = ident("legit-" <> UUID.uuid4())
+      thief = ident("thief-" <> UUID.uuid4())
+
+      doc = UUID.uuid4()
+      _ = CommitStore.create_commit(CommitStore, doc, <<1>>, nil)
+
+      # Cert minted for legit_reader's key...
+      {:ok, cert} =
+        Commonplace.Trust.Read.grant(root.ctx, doc, {legit_reader.uuid, legit_reader.pub},
+          store: CommitStore
+        )
+
+      # ...but the CALLING peer authenticates as `thief` (a different
+      # server-resolved identity/key) and merely PRESENTS the cert cid.
+      Application.put_env(:commonplace_web, :federation_peers, %{
+        @token => identity_bound_peer(thief.pub, identity_uuid: thief.uuid)
+      })
+
+      resp =
+        conn
+        |> authed()
+        |> get(~p"/federation/docs/#{doc}/cids?cert_cids=#{Base.encode64(cert.id)}")
+        |> json_response(200)
+
+      assert resp == %{"cids" => []}
+    end
+
+    test "a pinned (trusted_identities) peer is served without needing a cert at all", %{
+      conn: conn
+    } do
+      root = strict_root()
+      # The peer itself is pinned as a trusted identity — the `reader_authorized?`
+      # short-circuit, unchanged.
+      Application.put_env(:commonplace, :trust, %{
+        accept_unsigned: false,
+        trusted_identities: %{
+          root.uuid => Signing.encode_key(root.pub),
+          @peer => Signing.encode_key(root.pub)
+        }
+      })
+
+      Application.put_env(:commonplace_web, :federation_peers, %{
+        @token => identity_bound_peer(root.pub)
+      })
+
+      doc = UUID.uuid4()
+      _ = CommitStore.create_commit(CommitStore, doc, <<1>>, nil)
+
+      resp = conn |> authed() |> get(~p"/federation/docs/#{doc}/cids") |> json_response(200)
+      assert resp["cids"] != []
     end
   end
 
