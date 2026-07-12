@@ -3,9 +3,10 @@ defmodule Commonplace.CrossRepo.ApplyTest do
   B2 Seam-C: the editorial APPLY GATE (spec §6). Proves the trust seams:
 
     * NO-AUTHORITY — a proposal alone changes target X by nothing.
-    * THE BINDING — the proposer pubkey is resolved from A's OWN pinned config;
-      an unpinned proposer / a sig that doesn't verify against the pinned key is
-      refused.
+    * THE BINDING — the proposer pubkey is server-resolved by A (the key of the
+      peer whose outbox the proposal came from) and supplied to the apply gate;
+      a nil source key / a sig that doesn't verify against the supplied key is
+      refused. It is NEVER taken from the proposal.
     * APPLY = ORDINARY A-WRITE — accept yields exactly ONE new commit, signed by
       A (not B), whose content reflects the delta; runs under
       `local_write_gate: :enforce` with A holding authority.
@@ -160,28 +161,29 @@ defmodule Commonplace.CrossRepo.ApplyTest do
   end
 
   # ── THE BINDING ───────────────────────────────────────────────────────────
-  test "an unpinned proposer_id is refused with :unknown_proposer",
+  test "a nil source-peer pubkey (A has no pin for this source) is refused with :unknown_proposer",
        %{store: store, a_ctx: a_ctx, b_ctx: b_ctx, a_identity: a_id, a_pub: a_pub} do
-    # A pinned, but B is NOT pinned by A.
+    # A pinned itself, but has NO pinned key for the source peer B.
     put_trust(Map.new([pin(a_id, a_pub)]), true)
 
     {x, base} = create_target_x(store, a_ctx, "hello")
     mr = build_proposal(store, x, base, b_ctx, 5, " world", "add world")
 
-    assert {:error, :unknown_proposer} = Apply.apply_proposal(mr, a_ctx, store)
+    # No server-resolved source-peer key → refuse. The self-claimed
+    # `mr.proposer_id` is IRRELEVANT to the binding.
+    assert {:error, :unknown_proposer} = Apply.apply_proposal(mr, nil, a_ctx, store)
     assert read_x(store, x) == "hello"
   end
 
-  test "a proposer pinned to the WRONG key (sig doesn't verify) is refused with :bad_proposal",
-       %{store: store, a_ctx: a_ctx, b_ctx: b_ctx, b_identity: b_id} do
-    # A pins B's id, but to a DIFFERENT pubkey than B actually signs with.
+  test "a WRONG source-peer pubkey (sig doesn't verify) is refused with :bad_proposal",
+       %{store: store, a_ctx: a_ctx, b_ctx: b_ctx} do
+    # A supplies a DIFFERENT pubkey than B actually signed with.
     {wrong_pub, _wrong_priv} = Signing.generate_keypair()
-    put_trust(Map.new([pin(b_id, wrong_pub)]), true)
 
     {x, base} = create_target_x(store, a_ctx, "hello")
     mr = build_proposal(store, x, base, b_ctx, 5, " world", "add world")
 
-    assert {:error, :bad_proposal} = Apply.apply_proposal(mr, a_ctx, store)
+    assert {:error, :bad_proposal} = Apply.apply_proposal(mr, wrong_pub, a_ctx, store)
     assert read_x(store, x) == "hello"
   end
 
@@ -196,8 +198,9 @@ defmodule Commonplace.CrossRepo.ApplyTest do
          b_identity: b_id,
          b_pub: b_pub
        } do
-    # Strict + enforce, A holds authority (pinned root), B pinned for the binding.
-    put_trust(Map.new([pin(a_id, a_pub), pin(b_id, b_pub)]), false)
+    # Strict + enforce, A holds authority (pinned root). B's key is server-
+    # resolved by A and supplied to the apply gate (not pinned by identity_uuid).
+    put_trust(Map.new([pin(a_id, a_pub)]), false)
     Application.put_env(:commonplace, :local_write_gate, :enforce)
 
     {x, base} = create_target_x(store, a_ctx, "hello")
@@ -205,7 +208,7 @@ defmodule Commonplace.CrossRepo.ApplyTest do
 
     mr = build_proposal(store, x, base, b_ctx, 5, " world", "please apply")
 
-    assert {:ok, commit} = Apply.apply_proposal(mr, a_ctx, store)
+    assert {:ok, commit} = Apply.apply_proposal(mr, b_pub, a_ctx, store)
 
     # Exactly ONE new commit, chained onto the prior head.
     assert commit.parent_id == head_before
@@ -225,32 +228,32 @@ defmodule Commonplace.CrossRepo.ApplyTest do
   end
 
   test "a :write-authorized A still passes A's write-gate exactly as a hand edit (enforce)",
-       %{store: store, a_ctx: a_ctx, a_identity: a_id, a_pub: a_pub, b_ctx: b_ctx, b_identity: b_id, b_pub: b_pub} do
-    put_trust(Map.new([pin(a_id, a_pub), pin(b_id, b_pub)]), false)
+       %{store: store, a_ctx: a_ctx, a_identity: a_id, a_pub: a_pub, b_ctx: b_ctx, b_pub: b_pub} do
+    put_trust(Map.new([pin(a_id, a_pub)]), false)
     Application.put_env(:commonplace, :local_write_gate, :enforce)
 
     {x, base} = create_target_x(store, a_ctx, "abc")
     mr = build_proposal(store, x, base, b_ctx, 3, "def", "extend")
 
-    assert {:ok, _commit} = Apply.apply_proposal(mr, a_ctx, store)
+    assert {:ok, _commit} = Apply.apply_proposal(mr, b_pub, a_ctx, store)
     assert read_x(store, x) == "abcdef"
   end
 
   # ── IDEMPOTENCY ───────────────────────────────────────────────────────────
   test "applying the same proposal twice yields one commit + :already_applied",
-       %{store: store, a_ctx: a_ctx, a_identity: a_id, a_pub: a_pub, b_ctx: b_ctx, b_identity: b_id, b_pub: b_pub} do
-    put_trust(Map.new([pin(a_id, a_pub), pin(b_id, b_pub)]), false)
+       %{store: store, a_ctx: a_ctx, a_identity: a_id, a_pub: a_pub, b_ctx: b_ctx, b_pub: b_pub} do
+    put_trust(Map.new([pin(a_id, a_pub)]), false)
     Application.put_env(:commonplace, :local_write_gate, :enforce)
 
     {x, base} = create_target_x(store, a_ctx, "hello")
     mr = build_proposal(store, x, base, b_ctx, 5, " world", "once")
 
-    assert {:ok, commit} = Apply.apply_proposal(mr, a_ctx, store)
+    assert {:ok, commit} = Apply.apply_proposal(mr, b_pub, a_ctx, store)
     head_after_first = elem(CommitStoreClient.latest_commit(store, x), 1).id
     assert head_after_first == commit.id
 
     # Second apply of the SAME proposal: no second commit.
-    assert {:ok, :already_applied} = Apply.apply_proposal(mr, a_ctx, store)
+    assert {:ok, :already_applied} = Apply.apply_proposal(mr, b_pub, a_ctx, store)
     assert elem(CommitStoreClient.latest_commit(store, x), 1).id == head_after_first
     assert read_x(store, x) == "hello world"
   end
@@ -271,6 +274,10 @@ defmodule Commonplace.CrossRepo.ApplyTest do
   # ── review/5 editorial loop ───────────────────────────────────────────────
   test "review applies accepted and skips rejected proposals from an outbox",
        %{store: store, a_ctx: a_ctx, a_identity: a_id, a_pub: a_pub, b_ctx: b_ctx, b_identity: b_id, b_pub: b_pub} do
+    # NOTE: B's pin here is a TEST-FIXTURE artifact only — this in-process store
+    # hosts BOTH A's target and B's outbox, so B must be trusted to WRITE its own
+    # outbox under enforce. In reality B's outbox lives on B's store. It plays NO
+    # part in the binding: A authenticates via the `b_pub` it supplies to review.
     put_trust(Map.new([pin(a_id, a_pub), pin(b_id, b_pub)]), false)
     Application.put_env(:commonplace, :local_write_gate, :enforce)
 
@@ -284,7 +291,8 @@ defmodule Commonplace.CrossRepo.ApplyTest do
     :ok = Outbox.publish(outbox, reject_mr, b_ctx, store)
 
     decision = fn mr -> if mr.message == "ACCEPT", do: :accept, else: :reject end
-    results = Apply.review(outbox, decision, a_ctx, store)
+    # A server-resolves the owning peer's (B's) key for this outbox and threads it.
+    results = Apply.review(outbox, b_pub, decision, a_ctx, store)
 
     assert [{_, {:ok, %Commonplace.Store.Commit{}}}, {_, :ok}] = results
     # Only the accepted delta landed.

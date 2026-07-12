@@ -14,15 +14,21 @@ defmodule Commonplace.CrossRepo.Apply do
 
   ## The two load-bearing properties
 
-    1. **THE BINDING (attribution is trustworthy).** The proposer's expected
-       public key is resolved SERVER-SIDE from A's OWN pinned config —
-       `Commonplace.Trust.config/0`'s `trusted_identities[mr.proposer_id]` (the
-       key A pinned for B, exactly like Slice-0's server-resolved audience
-       binding). The pubkey is NEVER taken from the proposal itself or any
-       caller-claimed value. If A has not pinned `mr.proposer_id`,
-       `{:error, :unknown_proposer}` — A only applies proposals from roots it
-       explicitly trusts. A signature that does not verify against the pinned
-       key → `{:error, :bad_proposal}`.
+    1. **THE BINDING (attribution is server-resolved, never self-claimed).**
+       The proposer's expected public key is the raw Ed25519 key of the PEER
+       whose outbox A pulled this proposal from — resolved SERVER-SIDE by A from
+       A's OWN peer config (Slice-0 pins a foreign root under
+       `Commonplace.Federation.PeerTrust`'s `"peer:<name>"` anchor, NOT under
+       any identity_uuid). The caller supplies that server-resolved pubkey
+       explicitly; it is NEVER taken from the proposal itself (`mr.proposer_id`
+       is the proposal's own self-claim and MUST NOT be used to look up the
+       authenticating key). This is exactly Slice-0's discipline: the
+       authenticating identity comes from WHICH peer's outbox the proposal
+       arrived on, not from anything the proposal says about itself. A `nil`/
+       empty pubkey (A has no pinned key for this source) →
+       `{:error, :unknown_proposer}` — A only applies proposals from peers it
+       explicitly pinned. A signature that does not verify against the supplied
+       source-peer key → `{:error, :bad_proposal}`.
 
     2. **THE APPLY = AN ORDINARY A-WRITE (no bespoke gate — LBD-2).** On a
        verified proposal, A reconstructs the target, applies `mr.delta` as a
@@ -53,10 +59,9 @@ defmodule Commonplace.CrossRepo.Apply do
   """
 
   alias Commonplace.CrossRepo.{MergeRequest, Outbox}
-  alias Commonplace.Crypto.{Signing, SigningContext}
+  alias Commonplace.Crypto.SigningContext
   alias Commonplace.MUD.SignedWrite
   alias Commonplace.Store.CommitStoreClient
-  alias Commonplace.Trust
 
   @applied_table :cross_repo_applied_proposals
 
@@ -64,36 +69,36 @@ defmodule Commonplace.CrossRepo.Apply do
   Editorial APPLY of a verified merge-request.
 
     * `mr` — the signed `%MergeRequest{}` to apply.
+    * `proposer_pubkey` — the raw Ed25519 public key of the PEER whose outbox
+      this proposal was pulled from, resolved SERVER-SIDE by A from A's own peer
+      config (never taken from `mr`). A `nil`/empty value → `:unknown_proposer`.
     * `a_signing_context` — A's OWN `%SigningContext{}` (A's identity + key).
       The commit is authored and signed by THIS context — never by B.
     * `store` — the commit store (name or pid), default `CommitStoreClient`.
     * `opts`:
         * `:cert_cids` — A's held capability CIDs, threaded to
           `SignedWrite.opts_for/2` so the apply carries A's write-cert.
-        * `:trust_config` — override the pinned-config used for the binding
-          (defaults to `Trust.config/0`; A's real pinned anchors).
 
   Returns:
     * `{:ok, commit}` on a fresh apply (one new A-signed commit on the target),
     * `{:ok, :already_applied}` on a repeat (no second commit),
-    * `{:error, :unknown_proposer}` if A has not pinned `mr.proposer_id`,
+    * `{:error, :unknown_proposer}` if A has no pinned key for the source peer
+      (`proposer_pubkey` is `nil`/empty),
     * `{:error, :bad_proposal}` if the signature does not verify against the
-      pinned key,
+      supplied source-peer key,
     * `{:error, reason}` if A's own write-gate refuses the re-authored commit
       (the RCE/write fence firing exactly as for a hand edit).
   """
-  @spec apply_proposal(MergeRequest.t(), SigningContext.t(), term(), keyword()) ::
+  @spec apply_proposal(MergeRequest.t(), binary() | nil, SigningContext.t(), term(), keyword()) ::
           {:ok, Commonplace.Store.Commit.t()} | {:ok, :already_applied} | {:error, atom() | tuple()}
   def apply_proposal(
         %MergeRequest{} = mr,
+        proposer_pubkey,
         %SigningContext{} = a_signing_context,
         store \\ CommitStoreClient,
         opts \\ []
       ) do
-    cfg = Keyword.get(opts, :trust_config) || Trust.config()
-
-    with {:ok, pinned_keys} <- resolve_pinned_keys(cfg, mr.proposer_id),
-         :ok <- verify_or_refuse(mr, pinned_keys) do
+    with :ok <- verify_or_refuse(mr, proposer_pubkey) do
       pid = proposal_id(mr)
 
       if already_applied?(store, pid) do
@@ -129,20 +134,40 @@ defmodule Commonplace.CrossRepo.Apply do
   Thin editorial entry point: list every proposal in `outbox_uuid` and, per the
   caller's `decision_fn.(mr) :: :accept | :reject`, apply or reject each.
 
+    * `proposer_pubkey` — the raw Ed25519 public key of the peer that OWNS this
+      outbox, resolved SERVER-SIDE by A from A's own peer config for the outbox
+      A pulled from. It is threaded UNCHANGED to `apply_proposal/5` as the
+      authenticating source-peer key — it is NEVER derived from any proposal
+      field. All proposals in one outbox share the same owning peer, so one
+      pubkey authenticates the whole loop.
+
   Returns a list of `{mr, result}` in outbox order — the human-curated CLI is
   the intended surface, but this makes the accept/reject loop scriptable for
   tests and agents. (A full CLI command is a follow-up, not this run.)
   """
-  @spec review(String.t(), (MergeRequest.t() -> :accept | :reject), SigningContext.t(), term(), keyword()) ::
-          [{MergeRequest.t(), term()}]
-  def review(outbox_uuid, decision_fn, %SigningContext{} = a_signing_context, store \\ CommitStoreClient, opts \\ [])
+  @spec review(
+          String.t(),
+          binary() | nil,
+          (MergeRequest.t() -> :accept | :reject),
+          SigningContext.t(),
+          term(),
+          keyword()
+        ) :: [{MergeRequest.t(), term()}]
+  def review(
+        outbox_uuid,
+        proposer_pubkey,
+        decision_fn,
+        %SigningContext{} = a_signing_context,
+        store \\ CommitStoreClient,
+        opts \\ []
+      )
       when is_binary(outbox_uuid) and is_function(decision_fn, 1) do
     outbox_uuid
     |> Outbox.list(store)
     |> Enum.map(fn mr ->
       result =
         case decision_fn.(mr) do
-          :accept -> apply_proposal(mr, a_signing_context, store, opts)
+          :accept -> apply_proposal(mr, proposer_pubkey, a_signing_context, store, opts)
           :reject -> reject(mr, store, opts)
         end
 
@@ -159,40 +184,20 @@ defmodule Commonplace.CrossRepo.Apply do
     :crypto.hash(:sha256, MergeRequest.to_wire(mr))
   end
 
-  # ── THE BINDING — pinned pubkey resolved from A's OWN config ─────────────
+  # ── THE BINDING — source-peer pubkey supplied by the caller ──────────────
   #
-  # `trusted_identities` values are base64-encoded raw keys (a single string or
-  # a list of them — `Trust.verify_against_pinned/2` accepts both). Decode to
-  # raw bytes for `MergeRequest.verify/2`. An unpinned proposer, or a pin that
-  # decodes to nothing, is `:unknown_proposer` — A refuses to attribute.
-  defp resolve_pinned_keys(cfg, proposer_id) do
-    case Map.fetch(cfg.trusted_identities, proposer_id) do
-      {:ok, pinned} ->
-        keys =
-          pinned
-          |> List.wrap()
-          |> Enum.flat_map(fn encoded ->
-            case Signing.decode_key(encoded) do
-              {:ok, key} -> [key]
-              {:error, _} -> []
-            end
-          end)
+  # `proposer_pubkey` is the raw Ed25519 key A resolved SERVER-SIDE from its own
+  # peer config for the outbox this proposal was pulled from — never a value
+  # carried by the proposal. A `nil`/empty key means A has no pin for this
+  # source → `:unknown_proposer` (A refuses to attribute). A non-empty key that
+  # the signature does not verify against → `:bad_proposal`.
+  defp verify_or_refuse(%MergeRequest{}, pubkey) when pubkey in [nil, <<>>],
+    do: {:error, :unknown_proposer}
 
-        case keys do
-          [] -> {:error, :unknown_proposer}
-          _ -> {:ok, keys}
-        end
-
-      :error ->
-        {:error, :unknown_proposer}
-    end
-  end
-
-  defp verify_or_refuse(%MergeRequest{} = mr, pinned_keys) do
-    if Enum.any?(pinned_keys, fn key -> MergeRequest.verify(mr, key) == :ok end) do
-      :ok
-    else
-      {:error, :bad_proposal}
+  defp verify_or_refuse(%MergeRequest{} = mr, pubkey) when is_binary(pubkey) do
+    case MergeRequest.verify(mr, pubkey) do
+      :ok -> :ok
+      {:error, _} -> {:error, :bad_proposal}
     end
   end
 
