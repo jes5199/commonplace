@@ -79,4 +79,71 @@ defmodule Commonplace.CrossRepo.MergeRequestTest do
     shifted = %{base | target_uuid: "doc-X-uui", base_cid: "d" <> "cidbaseHEAD"}
     refute MergeRequest.canonical_bytes(base) == MergeRequest.canonical_bytes(shifted)
   end
+
+  describe "wire serialization (to_wire / from_wire)" do
+    test "round-trips the full proposal and integrity survives" do
+      {ctx, pub} = proposer_ctx()
+      mr = MergeRequest.sign(fields(), ctx)
+
+      wire = MergeRequest.to_wire(mr)
+      assert is_binary(wire)
+
+      assert {:ok, mr2} = MergeRequest.from_wire(wire)
+      assert mr2 == mr
+      # Integrity survives the wire round-trip: the reconstructed proposal
+      # still verifies against the signer's key.
+      assert :ok == MergeRequest.verify(mr2, pub)
+    end
+
+    test "round-trips fields with awkward bytes (empty, embedded nulls, 32-bit lengths)" do
+      {ctx, pub} = proposer_ctx()
+
+      mr =
+        MergeRequest.sign(
+          %{
+            target_uuid: "doc-X-uuid",
+            base_cid: "",
+            delta: <<0, 0, 0, 4, 0, 255>>,
+            message: "note with \0 embedded null and unicode ✓"
+          },
+          ctx
+        )
+
+      assert {:ok, mr2} = MergeRequest.from_wire(MergeRequest.to_wire(mr))
+      assert mr2 == mr
+      assert :ok == MergeRequest.verify(mr2, pub)
+    end
+
+    test "corrupted wire bytes return {:error, _} without raising" do
+      {ctx, _pub} = proposer_ctx()
+      wire = MergeRequest.to_wire(MergeRequest.sign(fields(), ctx))
+
+      # Not valid Base64.
+      assert {:error, _} = MergeRequest.from_wire("!!! not base64 !!!")
+      # Valid Base64 but truncated payload (drop the tail).
+      truncated = binary_part(wire, 0, div(byte_size(wire), 2))
+      assert {:error, _} = MergeRequest.from_wire(truncated)
+      # Valid Base64 of an unknown/absent version tag.
+      assert {:error, _} = MergeRequest.from_wire(Base.encode64(<<>>))
+      assert {:error, _} = MergeRequest.from_wire(Base.encode64(<<99, 1, 2, 3>>))
+      # Non-binary input.
+      assert {:error, _} = MergeRequest.from_wire(:not_a_binary)
+    end
+
+    test "flipping a byte inside the wire either fails to parse or fails to verify" do
+      {ctx, pub} = proposer_ctx()
+      wire = MergeRequest.to_wire(MergeRequest.sign(fields(), ctx))
+
+      {:ok, raw} = Base.decode64(wire)
+      # Flip a byte in the middle of the payload.
+      i = div(byte_size(raw), 2)
+      <<head::binary-size(i), b, tail::binary>> = raw
+      corrupted = Base.encode64(<<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>)
+
+      case MergeRequest.from_wire(corrupted) do
+        {:error, _} -> :ok
+        {:ok, mr2} -> assert {:error, _} = MergeRequest.verify(mr2, pub)
+      end
+    end
+  end
 end
