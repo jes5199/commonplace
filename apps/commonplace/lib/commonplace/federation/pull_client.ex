@@ -166,6 +166,15 @@ defmodule Commonplace.Federation.PullClient do
         :ok ->
           %{acc | imported: acc.imported + 1}
 
+        # Idempotent re-import: the commit is already present (e.g. a
+        # genesis back-filled as a first real commit's parent, which the
+        # peer keeps serving in its CID set and the local diff can re-offer
+        # on a later poll). A periodic puller MUST tolerate this — treat it
+        # as a benign no-op, not a crash. (Single-shot pulls never reached
+        # a second cycle, so this only surfaces under interval polling.)
+        :already_exists ->
+          acc
+
         {:error, {:trust_rejected, :awaiting_capability}} ->
           %{acc | deferred: acc.deferred + 1}
 
