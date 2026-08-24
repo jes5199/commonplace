@@ -28,11 +28,25 @@
 
 set -uo pipefail
 
-MAIN_CHECKOUT="/home/jes/commonplace"
+# 2026-08-24: the repo was renamed to commonplace-monolith and
+# /home/jes/commonplace became a SYMLINK to it. `git rev-parse
+# --show-toplevel` reports the PHYSICAL path, so this compared
+# /home/jes/commonplace-monolith against the literal /home/jes/commonplace
+# and REFUSED in the one place it is supposed to run — a gate firing on
+# correct state, which is worse than no gate. Demonstrated before fixing:
+# on main, in the main checkout, with a green branch, rc=1.
+#
+# Both sides are resolved to their physical path so either spelling works.
+# The guard's PURPOSE is untouched: a worktree still has a different
+# toplevel and is still refused. Widening it to "any path ending in
+# commonplace*" would have been the allowlist-shaped fix — accepting
+# worktrees is exactly what this exists to prevent.
+MAIN_CHECKOUT="$(cd /home/jes/commonplace 2>/dev/null && pwd -P || echo /home/jes/commonplace)"
 BRANCH="${1:?usage: cp-merge <branch> <message>}"
 MESSAGE="${2:?usage: cp-merge <branch> <message>}"
 
 HERE="$(git rev-parse --show-toplevel 2>/dev/null)"
+HERE="$(cd "${HERE:-/nonexistent}" 2>/dev/null && pwd -P || echo "$HERE")"
 
 if [[ "$HERE" != "$MAIN_CHECKOUT" ]]; then
   echo "cp-merge: REFUSED — not in the main checkout." >&2
