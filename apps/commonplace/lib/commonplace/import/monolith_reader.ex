@@ -167,26 +167,17 @@ defmodule Commonplace.Import.MonolithReader do
 
   One unbounded pass over the keyspace: a range-bounded scan risks
   dropping the high end silently, and both populations must come from
-  the same traversal to be comparable at all.
+  the same traversal to be comparable at all. That pass belongs to the
+  storage adapter, not here — see `CommitStore.import_population/1`. An
+  earlier draft of this function reached for `CommitStore.db_handle/1`
+  and `CubDB.select` directly; the read-perimeter guard
+  (`scripts/check_commonplace_cubdb_reads.exs`) refused it in CI, which
+  is the guard doing exactly its job on the newest caller.
   """
   @spec list_documents(handle()) ::
           {:ok, [%{document_id: document_id(), head_commit_id: commit_id() | nil}], map()}
   def list_documents(%{store: name}) do
-    db = CommitStore.db_handle(name)
-
-    {owned, heads} =
-      db
-      |> CubDB.select()
-      |> Enum.reduce({MapSet.new(), %{}}, fn
-        {{:doc_commit, doc_uuid, _id}, _v}, {owned, heads} ->
-          {MapSet.put(owned, doc_uuid), heads}
-
-        {{:latest, doc_uuid}, commit_id}, {owned, heads} ->
-          {owned, Map.put(heads, doc_uuid, commit_id)}
-
-        _other, acc ->
-          acc
-      end)
+    %{owned: owned, heads: heads} = CommitStore.import_population(name)
 
     headed = heads |> Map.keys() |> MapSet.new()
 

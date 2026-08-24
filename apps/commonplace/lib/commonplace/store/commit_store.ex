@@ -1340,6 +1340,41 @@ defmodule Commonplace.Store.CommitStore do
   end
 
   @doc """
+  The import enumeration: every document that is importable, plus its head
+  pointer where it has one, from ONE unbounded pass over the keyspace.
+
+  `population_scan/1` already answers most of this, but it reports
+  `p_latest` as doc_uuids ONLY — presence of a head, not which commit the
+  head is. Import needs the commit id itself, because a head pointer is
+  the default pin offered to the destination. Rather than have the caller
+  reach for `db_handle/1`, the pass lives here, in the layer that owns the
+  handle.
+
+    * `owned` — doc_uuids from `{:doc_commit, doc_uuid, _}` keys. THE
+      ownership fact: `{:latest}`-independent and fork-safe. Never
+      `commit.doc_uuid`, which is a first-writer trace (`commit.ex:52`),
+      excluded from the id hash and measured wrong for 116 docs.
+    * `heads` — `%{doc_uuid => commit_id}` from `{:latest, doc_uuid}`.
+
+  Both populations come from the SAME traversal, which is what makes them
+  comparable at all: two passes could see two different stores. And the
+  pass is UNBOUNDED for the CX-mg8s reason carried throughout this module
+  — a range bound shared by both keyspaces drops the same high end from
+  both, so the difference between them comes back empty and certifies a
+  truncated population as clean.
+
+  O(store): deserializes every value. Import is a one-shot migration
+  operation, not a request path.
+  """
+  @spec import_population(GenServer.server()) :: %{
+          owned: MapSet.t(),
+          heads: %{optional(String.t()) => binary()}
+        }
+  def import_population(server \\ __MODULE__) do
+    do_import_population(resolve_db(server))
+  end
+
+  @doc """
   The `{:doc_commit}` index readiness state (`@doc_commit_index_ready` when
   built). World-B checks this before trusting the `{:doc_commit}` populations:
   a not-ready index scanned fully is partial/interrupted, and its doc_uuids are
@@ -3524,6 +3559,29 @@ defmodule Commonplace.Store.CommitStore do
   end
 
   defp route_population_row(_other_key, _value, acc), do: acc
+
+  # Same shape as `do_population_scan/1`, and for the same reasons: one
+  # UNBOUNDED select, routing by key SHAPE in NAMED function clauses rather
+  # than an inline `fn`. The naming is not style — an inline clause would
+  # begin a line with `{{:latest,` and trip `InvariantChokeTest`'s
+  # head-pointer-WRITE source scan (the R1 choke pin) on what is a READ.
+  defp do_import_population(db) do
+    db
+    |> CubDB.select()
+    |> Enum.reduce(%{owned: MapSet.new(), heads: %{}}, fn {key, value}, acc ->
+      route_import_row(key, value, acc)
+    end)
+  end
+
+  defp route_import_row({:doc_commit, doc_uuid, _id}, _v, acc) do
+    %{acc | owned: MapSet.put(acc.owned, doc_uuid)}
+  end
+
+  defp route_import_row({:latest, doc_uuid}, commit_id, acc) do
+    %{acc | heads: Map.put(acc.heads, doc_uuid, commit_id)}
+  end
+
+  defp route_import_row(_other_key, _value, acc), do: acc
 
   defp do_bd_issue_doc_uuids(db) do
     CubDB.select(db,
