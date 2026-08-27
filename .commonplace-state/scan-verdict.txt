@@ -1,1 +1,1 @@
-VERDICT: DISCREPANCIES — 112/287 shipped-but-OPEN; 6/547 closed-but-unreferenced SHAPES; scanned 2026-08-07T14:30Z; export as_of 2026-08-07T14:30Z (age 0h 0m)
+VERDICT: DISCREPANCIES — 149/351 shipped-but-OPEN; 7/636 closed-but-unreferenced SHAPES; scanned 2026-08-27T18:19Z; export as_of 2026-08-27T14:47Z (age 3h 32m)

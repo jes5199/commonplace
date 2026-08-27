@@ -4,7 +4,7 @@
 
 <!-- state-projection:begin -->
 Read STATE.md before scoping any work.
-Rendered at: 2026-08-18T17:46Z.
+Rendered at: 2026-08-27T14:47Z.
 <!-- state-projection:end -->
 
 Commonplace is a CRDT document store built on Elixir/OTP. Every piece of data is a Y.js-compatible CRDT document identified by a UUID, organized in a tree via schema documents. The system provides branching (deep-copy fork), three-way merging, a Merkle-CRDT commit DAG, and bidirectional filesystem sync.
